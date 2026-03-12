@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 3456);
@@ -15,6 +16,12 @@ const DEFAULT_PRINTER =
 const DEFAULT_MEDIA = process.env.DEFAULT_MEDIA || "";
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 25 * 1024 * 1024);
 const TMP_ROOT = process.env.TMPDIR || os.tmpdir();
+const JOB_POLL_MS = Number(process.env.JOB_POLL_MS || 2000);
+const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 20 * 60 * 1000);
+const DB_PATH =
+  process.env.DB_PATH ||
+  path.join(__dirname, "data", "dnp-print-bridge.sqlite");
+const STATS_RECENT_LIMIT = Number(process.env.STATS_RECENT_LIMIT || 20);
 
 const MIME_EXTENSIONS = {
   "application/pdf": ".pdf",
@@ -35,6 +42,21 @@ const FRIENDLY_MEDIA_MAP = {
   "8x6": "310dnp6x8",
 };
 
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.name = "HttpError";
+    this.statusCode = statusCode;
+  }
+}
+
+let db;
+let nextQueueOrder = 1;
+const jobs = new Map();
+const queuedJobIds = [];
+let activeJobId = null;
+let queueWorkerRunning = false;
+
 function sendJson(res, statusCode, body) {
   const payload = JSON.stringify(body, null, 2);
   res.writeHead(statusCode, {
@@ -42,6 +64,10 @@ function sendJson(res, statusCode, body) {
     "content-length": Buffer.byteLength(payload),
   });
   res.end(payload);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function spawnAndCollect(command, args) {
@@ -76,7 +102,7 @@ async function readJsonBody(req) {
   for await (const chunk of req) {
     size += chunk.length;
     if (size > MAX_BODY_BYTES) {
-      throw new Error(`Request body exceeded ${MAX_BODY_BYTES} bytes`);
+      throw new HttpError(413, `Request body exceeded ${MAX_BODY_BYTES} bytes`);
     }
     chunks.push(chunk);
   }
@@ -85,7 +111,11 @@ async function readJsonBody(req) {
     return {};
   }
 
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new HttpError(400, "Invalid JSON body");
+  }
 }
 
 function assertAuthorized(req) {
@@ -96,9 +126,7 @@ function assertAuthorized(req) {
   const header = req.headers.authorization || "";
   const expected = `Bearer ${AUTH_TOKEN}`;
   if (header !== expected) {
-    const error = new Error("Unauthorized");
-    error.statusCode = 401;
-    throw error;
+    throw new HttpError(401, "Unauthorized");
   }
 }
 
@@ -140,40 +168,285 @@ function normalizeFriendlyMedia(value) {
   return FRIENDLY_MEDIA_MAP[normalized] || raw;
 }
 
-async function writePrintFile(payload) {
-  const tempDir = await fs.mkdtemp(path.join(TMP_ROOT, "dnp-print-"));
-  const jobName = sanitizeJobName(payload.jobName);
-  const parsedBase64 = normalizeBase64(payload.data || payload.dataUrl);
-  const contentType = payload.contentType || parsedBase64.contentType;
-  const extension = extensionForMime(contentType);
-  const filePath = path.join(tempDir, `${jobName}-${randomUUID()}${extension}`);
+function parseCupsRequestId(lpOutput) {
+  const match = String(lpOutput || "").match(/request id is (\S+) \(/);
+  return match ? match[1] : null;
+}
 
+async function initDatabase() {
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
+  db = new DatabaseSync(DB_PATH);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      queue_order INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      printer TEXT NOT NULL,
+      job_name TEXT NOT NULL,
+      copies INTEGER NOT NULL,
+      requested_size TEXT,
+      media TEXT,
+      payload_json TEXT NOT NULL,
+      file_path TEXT,
+      cleanup_dir TEXT,
+      cups_request_id TEXT,
+      error TEXT,
+      created_at TEXT NOT NULL,
+      started_at TEXT,
+      completed_at TEXT,
+      is_terminal INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_queue_order ON jobs(queue_order);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at);
+  `);
+
+  const row = db
+    .prepare("SELECT COALESCE(MAX(queue_order), 0) + 1 AS next_queue_order FROM jobs")
+    .get();
+  nextQueueOrder = Number(row.next_queue_order || 1);
+}
+
+function persistJob(job) {
+  db.prepare(
+    `
+      INSERT INTO jobs (
+        id,
+        queue_order,
+        status,
+        printer,
+        job_name,
+        copies,
+        requested_size,
+        media,
+        payload_json,
+        file_path,
+        cleanup_dir,
+        cups_request_id,
+        error,
+        created_at,
+        started_at,
+        completed_at,
+        is_terminal
+      ) VALUES (
+        @id,
+        @queue_order,
+        @status,
+        @printer,
+        @job_name,
+        @copies,
+        @requested_size,
+        @media,
+        @payload_json,
+        @file_path,
+        @cleanup_dir,
+        @cups_request_id,
+        @error,
+        @created_at,
+        @started_at,
+        @completed_at,
+        @is_terminal
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        queue_order = excluded.queue_order,
+        status = excluded.status,
+        printer = excluded.printer,
+        job_name = excluded.job_name,
+        copies = excluded.copies,
+        requested_size = excluded.requested_size,
+        media = excluded.media,
+        payload_json = excluded.payload_json,
+        file_path = excluded.file_path,
+        cleanup_dir = excluded.cleanup_dir,
+        cups_request_id = excluded.cups_request_id,
+        error = excluded.error,
+        created_at = excluded.created_at,
+        started_at = excluded.started_at,
+        completed_at = excluded.completed_at,
+        is_terminal = excluded.is_terminal
+    `
+  ).run({
+    id: job.id,
+    queue_order: job.queueOrder,
+    status: job.status,
+    printer: job.printer,
+    job_name: job.jobName,
+    copies: job.copies,
+    requested_size: job.requestedSize || "",
+    media: job.media || "",
+    payload_json: JSON.stringify(job.payload),
+    file_path: job.filePath || null,
+    cleanup_dir: job.cleanupDir || null,
+    cups_request_id: job.cupsRequestId || null,
+    error: job.error || null,
+    created_at: job.createdAt,
+    started_at: job.startedAt || null,
+    completed_at: job.completedAt || null,
+    is_terminal: job.isTerminal ? 1 : 0,
+  });
+}
+
+function hydrateJob(row) {
+  return {
+    id: row.id,
+    queueOrder: Number(row.queue_order),
+    status: row.status,
+    printer: row.printer,
+    jobName: row.job_name,
+    copies: Number(row.copies),
+    requestedSize: row.requested_size || "",
+    media: row.media || "",
+    payload: JSON.parse(row.payload_json),
+    filePath: row.file_path || null,
+    cleanupDir: row.cleanup_dir || null,
+    cupsRequestId: row.cups_request_id || null,
+    error: row.error || null,
+    createdAt: row.created_at,
+    startedAt: row.started_at || null,
+    completedAt: row.completed_at || null,
+    isTerminal: Boolean(row.is_terminal),
+  };
+}
+
+function updateJob(job, updates) {
+  Object.assign(job, updates);
+  persistJob(job);
+}
+
+function computeJobsAhead(jobId) {
+  let count = 0;
+
+  if (activeJobId && activeJobId !== jobId) {
+    const activeJob = jobs.get(activeJobId);
+    if (activeJob && !activeJob.isTerminal) {
+      count += 1;
+    }
+  }
+
+  for (const queuedJobId of queuedJobIds) {
+    if (queuedJobId === jobId) {
+      break;
+    }
+    const queuedJob = jobs.get(queuedJobId);
+    if (queuedJob && !queuedJob.isTerminal) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function buildJobResponse(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    printer: job.printer,
+    jobName: job.jobName,
+    copies: job.copies,
+    size: job.requestedSize || null,
+    media: job.media || null,
+    jobsAhead: computeJobsAhead(job.id),
+    cupsRequestId: job.cupsRequestId || null,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt || null,
+    completedAt: job.completedAt || null,
+    error: job.error || null,
+  };
+}
+
+function buildRecentJobResponse(row) {
+  return {
+    id: row.id,
+    status: row.status,
+    printer: row.printer,
+    jobName: row.job_name,
+    copies: Number(row.copies),
+    size: row.requested_size || null,
+    media: row.media || null,
+    cupsRequestId: row.cups_request_id || null,
+    createdAt: row.created_at,
+    startedAt: row.started_at || null,
+    completedAt: row.completed_at || null,
+    error: row.error || null,
+  };
+}
+
+async function writePrintFile(payload) {
   if (payload.data || payload.dataUrl) {
+    const tempDir = await fs.mkdtemp(path.join(TMP_ROOT, "dnp-print-"));
+    const jobName = sanitizeJobName(payload.jobName);
+    const parsedBase64 = normalizeBase64(payload.data || payload.dataUrl);
+    const contentType = payload.contentType || parsedBase64.contentType;
+    const extension = extensionForMime(contentType);
+    const filePath = path.join(
+      tempDir,
+      `${jobName}-${randomUUID()}${extension}`
+    );
     await fs.writeFile(filePath, Buffer.from(parsedBase64.data, "base64"));
-    return filePath;
+    return { filePath, cleanupDir: tempDir };
   }
 
   if (payload.url) {
-    const response = await fetch(payload.url);
-    if (!response.ok) {
-      throw new Error(`Fetch failed with HTTP ${response.status}`);
+    let response;
+    try {
+      response = await fetch(payload.url);
+    } catch {
+      throw new HttpError(502, "Failed to fetch remote file");
     }
+
+    if (!response.ok) {
+      throw new HttpError(502, `Fetch failed with HTTP ${response.status}`);
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(TMP_ROOT, "dnp-print-"));
+    const jobName = sanitizeJobName(payload.jobName);
+    const contentType = payload.contentType || response.headers.get("content-type");
+    const extension = extensionForMime(contentType);
+    const filePath = path.join(
+      tempDir,
+      `${jobName}-${randomUUID()}${extension}`
+    );
     const arrayBuffer = await response.arrayBuffer();
     await fs.writeFile(filePath, Buffer.from(arrayBuffer));
-    return filePath;
+    return { filePath, cleanupDir: tempDir };
   }
 
   if (payload.filePath) {
-    return String(payload.filePath);
+    const filePath = String(payload.filePath);
+    try {
+      await fs.access(filePath);
+    } catch {
+      throw new HttpError(400, "filePath does not exist or is not readable");
+    }
+    return { filePath, cleanupDir: null };
   }
 
-  throw new Error("Provide one of: data, dataUrl, url, or filePath");
+  throw new HttpError(400, "Provide one of: data, dataUrl, url, or filePath");
+}
+
+async function ensurePrintableFile(job) {
+  if (job.filePath) {
+    try {
+      await fs.access(job.filePath);
+      return;
+    } catch {
+      // Rebuild below.
+    }
+  }
+
+  const written = await writePrintFile(job.payload);
+  updateJob(job, {
+    filePath: written.filePath,
+    cleanupDir: written.cleanupDir,
+  });
 }
 
 function buildLpArgs(payload, filePath) {
   const printer = payload.printer || DEFAULT_PRINTER;
   if (!printer) {
-    throw new Error("No printer specified and PRINTER_NAME is not set");
+    throw new HttpError(400, "No printer specified and PRINTER_NAME is not set");
   }
 
   const args = ["-d", printer];
@@ -182,7 +455,7 @@ function buildLpArgs(payload, filePath) {
 
   const copies = Number(payload.copies || 1);
   if (!Number.isInteger(copies) || copies < 1 || copies > 99) {
-    throw new Error("copies must be an integer between 1 and 99");
+    throw new HttpError(400, "copies must be an integer between 1 and 99");
   }
   args.push("-n", String(copies));
 
@@ -202,16 +475,16 @@ function buildLpArgs(payload, filePath) {
   }
 
   args.push(filePath);
-  return { printer, args };
+  return { printer, args, media, jobName, copies };
 }
 
 async function listPrinters() {
   const result = await spawnAndCollect("lpstat", ["-p"]);
   if (result.code !== 0) {
-    throw new Error(result.stderr || "lpstat -p failed");
+    throw new HttpError(500, result.stderr || "lpstat -p failed");
   }
 
-  const printers = result.stdout
+  return result.stdout
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
@@ -225,43 +498,351 @@ async function listPrinters() {
         status: match[2],
       };
     });
+}
 
-  return printers;
+async function listOutstandingCupsJobs(printer) {
+  const result = await spawnAndCollect("lpstat", [
+    "-W",
+    "not-completed",
+    "-o",
+    printer,
+  ]);
+
+  if (result.code !== 0) {
+    throw new Error(result.stderr || "lpstat -W not-completed failed");
+  }
+
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split(/\s+/)[0]);
+}
+
+async function waitForCupsJobToFinish(job) {
+  const deadline = Date.now() + JOB_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    const outstanding = await listOutstandingCupsJobs(job.printer);
+    if (!outstanding.includes(job.cupsRequestId)) {
+      return;
+    }
+    await sleep(JOB_POLL_MS);
+  }
+
+  throw new Error(
+    `Timed out waiting for CUPS job ${job.cupsRequestId} to finish`
+  );
+}
+
+function finalizeJobFile(job) {
+  if (!job.cleanupDir) {
+    return;
+  }
+
+  const cleanupDir = job.cleanupDir;
+  job.filePath = null;
+  job.cleanupDir = null;
+  persistJob(job);
+  fs.rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
+}
+
+function markJobCompleted(job) {
+  updateJob(job, {
+    status: "completed",
+    completedAt: job.completedAt || new Date().toISOString(),
+    isTerminal: true,
+    error: null,
+  });
+  finalizeJobFile(job);
+}
+
+function markJobFailed(job, message) {
+  updateJob(job, {
+    status: "failed",
+    completedAt: new Date().toISOString(),
+    isTerminal: true,
+    error: message,
+  });
+  finalizeJobFile(job);
+}
+
+async function runJob(job, options = {}) {
+  const skipSubmission = Boolean(options.skipSubmission);
+  activeJobId = job.id;
+
+  try {
+    if (skipSubmission) {
+      updateJob(job, {
+        status: "printing",
+        startedAt: job.startedAt || new Date().toISOString(),
+        isTerminal: false,
+      });
+    } else {
+      updateJob(job, {
+        status: "submitting",
+        startedAt: job.startedAt || new Date().toISOString(),
+        completedAt: null,
+        error: null,
+        isTerminal: false,
+      });
+
+      await ensurePrintableFile(job);
+      const submission = buildLpArgs(job.payload, job.filePath);
+      const result = await spawnAndCollect("lp", submission.args);
+
+      if (result.code !== 0) {
+        throw new Error(result.stderr || result.stdout || "lp failed");
+      }
+
+      const cupsRequestId = parseCupsRequestId(result.stdout);
+      if (!cupsRequestId) {
+        throw new Error("Unable to parse CUPS request id from lp output");
+      }
+
+      updateJob(job, {
+        status: "printing",
+        cupsRequestId,
+      });
+    }
+
+    await waitForCupsJobToFinish(job);
+    markJobCompleted(job);
+  } catch (error) {
+    markJobFailed(job, error.message);
+  } finally {
+    activeJobId = null;
+    kickQueueWorker();
+  }
+}
+
+function kickQueueWorker() {
+  processNextJob().catch((error) => {
+    console.error("queue worker error:", error);
+  });
+}
+
+async function processNextJob() {
+  if (queueWorkerRunning || activeJobId) {
+    return;
+  }
+
+  queueWorkerRunning = true;
+
+  try {
+    while (!activeJobId && queuedJobIds.length > 0) {
+      const nextJobId = queuedJobIds.shift();
+      const job = jobs.get(nextJobId);
+      if (!job || job.isTerminal) {
+        continue;
+      }
+
+      await runJob(job);
+    }
+  } finally {
+    queueWorkerRunning = false;
+  }
+}
+
+async function restoreJobsFromDatabase() {
+  jobs.clear();
+  queuedJobIds.length = 0;
+  activeJobId = null;
+
+  const rows = db
+    .prepare("SELECT * FROM jobs ORDER BY queue_order ASC, created_at ASC")
+    .all();
+  const outstandingCache = new Map();
+
+  async function getOutstanding(printer) {
+    if (!outstandingCache.has(printer)) {
+      outstandingCache.set(printer, await listOutstandingCupsJobs(printer));
+    }
+    return outstandingCache.get(printer);
+  }
+
+  for (const row of rows) {
+    const job = hydrateJob(row);
+    jobs.set(job.id, job);
+  }
+
+  for (const job of jobs.values()) {
+    if (job.isTerminal || job.status === "completed" || job.status === "failed") {
+      job.isTerminal = true;
+      persistJob(job);
+      finalizeJobFile(job);
+      continue;
+    }
+
+    if (job.status === "queued" || (job.status === "submitting" && !job.cupsRequestId)) {
+      updateJob(job, {
+        status: "queued",
+        startedAt: null,
+        completedAt: null,
+        error: null,
+        isTerminal: false,
+      });
+      queuedJobIds.push(job.id);
+      continue;
+    }
+
+    if (job.cupsRequestId) {
+      const outstanding = await getOutstanding(job.printer);
+      if (outstanding.includes(job.cupsRequestId) && !activeJobId) {
+        updateJob(job, {
+          status: "printing",
+          isTerminal: false,
+        });
+        activeJobId = job.id;
+        continue;
+      }
+
+      if (outstanding.includes(job.cupsRequestId) && activeJobId) {
+        markJobFailed(job, "Multiple active bridge jobs found during recovery");
+        continue;
+      }
+
+      markJobCompleted(job);
+      continue;
+    }
+
+    updateJob(job, {
+      status: "queued",
+      startedAt: null,
+      completedAt: null,
+      error: null,
+      isTerminal: false,
+    });
+    queuedJobIds.push(job.id);
+  }
+
+  if (activeJobId) {
+    const activeJob = jobs.get(activeJobId);
+    if (activeJob) {
+      runJob(activeJob, { skipSubmission: true }).catch((error) => {
+        console.error("recovery worker error:", error);
+      });
+    }
+  }
+
+  kickQueueWorker();
+}
+
+function getStats(limit = STATS_RECENT_LIMIT) {
+  const totals = db
+    .prepare(
+      `
+        SELECT
+          COUNT(*) AS total_jobs,
+          COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_jobs,
+          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_jobs,
+          COALESCE(SUM(CASE WHEN status IN ('queued', 'submitting', 'printing') THEN 1 ELSE 0 END), 0) AS open_jobs
+        FROM jobs
+      `
+    )
+    .get();
+
+  const recentJobs = db
+    .prepare(
+      `
+        SELECT
+          id,
+          status,
+          printer,
+          job_name,
+          copies,
+          requested_size,
+          media,
+          cups_request_id,
+          created_at,
+          started_at,
+          completed_at,
+          error
+        FROM jobs
+        ORDER BY queue_order DESC
+        LIMIT ?
+      `
+    )
+    .all(limit)
+    .map(buildRecentJobResponse);
+
+  return {
+    dbPath: DB_PATH,
+    totalJobs: Number(totals.total_jobs),
+    completedJobs: Number(totals.completed_jobs),
+    failedJobs: Number(totals.failed_jobs),
+    openJobs: Number(totals.open_jobs),
+    activeJobId,
+    queuedJobs: queuedJobIds.length,
+    recentJobs,
+  };
 }
 
 async function handlePrint(req, res) {
   assertAuthorized(req);
   const payload = await readJsonBody(req);
-  const filePath = await writePrintFile(payload);
-  let result;
+  const written = await writePrintFile(payload);
+  const preview = buildLpArgs(payload, written.filePath);
+  const now = new Date().toISOString();
+  const job = {
+    id: randomUUID(),
+    queueOrder: nextQueueOrder++,
+    status: "queued",
+    printer: preview.printer,
+    jobName: preview.jobName,
+    copies: preview.copies,
+    requestedSize: payload.size || payload.media || DEFAULT_MEDIA || "",
+    media: preview.media || "",
+    payload,
+    filePath: written.filePath,
+    cleanupDir: written.cleanupDir,
+    cupsRequestId: null,
+    error: null,
+    createdAt: now,
+    startedAt: null,
+    completedAt: null,
+    isTerminal: false,
+  };
 
-  try {
-    const { printer, args } = buildLpArgs(payload, filePath);
-    result = await spawnAndCollect("lp", args);
+  jobs.set(job.id, job);
+  persistJob(job);
+  queuedJobIds.push(job.id);
+  kickQueueWorker();
 
-    if (result.code !== 0) {
-      throw new Error(result.stderr || result.stdout || "lp failed");
-    }
+  sendJson(res, 202, {
+    ok: true,
+    message: "Job accepted and queued for printing",
+    job: buildJobResponse(job),
+  });
+}
 
-    sendJson(res, 200, {
-      ok: true,
-      printer,
-      command: ["lp", ...args.slice(0, -1), "<temp-file>"],
-      lpOutput: result.stdout,
-      sourceFile: filePath,
-    });
-  } finally {
-    if (result && result.code === 0 && filePath.startsWith(TMP_ROOT)) {
-      fs.rm(path.dirname(filePath), { recursive: true, force: true }).catch(
-        () => {}
-      );
-    }
+async function handleJobLookup(req, res, jobId) {
+  assertAuthorized(req);
+  const job = jobs.get(jobId);
+  if (!job) {
+    throw new HttpError(404, "Job not found");
   }
+
+  sendJson(res, 200, {
+    ok: true,
+    job: buildJobResponse(job),
+  });
+}
+
+async function handleStats(req, res, url) {
+  assertAuthorized(req);
+  const limit = Number(url.searchParams.get("limit") || STATS_RECENT_LIMIT);
+  sendJson(res, 200, {
+    ok: true,
+    stats: getStats(Number.isInteger(limit) && limit > 0 ? limit : STATS_RECENT_LIMIT),
+  });
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    if (req.method === "GET" && req.url === "/health") {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, {
         ok: true,
         host: HOST,
@@ -269,11 +850,17 @@ const server = http.createServer(async (req, res) => {
         defaultPrinter: DEFAULT_PRINTER,
         defaultMedia: DEFAULT_MEDIA,
         authEnabled: Boolean(AUTH_TOKEN),
+        dbPath: DB_PATH,
+        queue: {
+          activeJobId,
+          queued: queuedJobIds.length,
+          knownJobs: jobs.size,
+        },
       });
       return;
     }
 
-    if (req.method === "GET" && req.url === "/printers") {
+    if (req.method === "GET" && url.pathname === "/printers") {
       assertAuthorized(req);
       sendJson(res, 200, {
         ok: true,
@@ -283,8 +870,19 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "POST" && req.url === "/print") {
+    if (req.method === "GET" && url.pathname === "/stats") {
+      await handleStats(req, res, url);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/print") {
       await handlePrint(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/jobs/")) {
+      const jobId = decodeURIComponent(url.pathname.slice("/jobs/".length));
+      await handleJobLookup(req, res, jobId);
       return;
     }
 
@@ -298,8 +896,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(
-    `dnp-print-bridge listening on http://${HOST}:${PORT} using printer "${DEFAULT_PRINTER}"`
-  );
+async function main() {
+  await initDatabase();
+  await restoreJobsFromDatabase();
+  server.listen(PORT, HOST, () => {
+    console.log(
+      `dnp-print-bridge listening on http://${HOST}:${PORT} using printer "${DEFAULT_PRINTER}"`
+    );
+    console.log(`sqlite database: ${DB_PATH}`);
+  });
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });
