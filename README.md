@@ -30,7 +30,7 @@ Optional environment variables:
 ```bash
 HOST=0.0.0.0
 PORT=3456
-PRINTER_NAME=Your_Printer_Queue_Name
+PRINTER_NAME=Your_Printer_Queue_Name_Or_Prefix
 DEFAULT_MEDIA=4x6
 AUTH_TOKEN=replace-me
 DB_PATH=/path/to/dnp-print-bridge.sqlite
@@ -41,10 +41,31 @@ Notes:
 
 - Keep `HOST=127.0.0.1` if only the local Mac should call it.
 - Use `HOST=0.0.0.0` plus `AUTH_TOKEN` if your Android tablet will call it over LAN.
+- `PRINTER_NAME` is optional and acts as a hint. The bridge will try to pick an enabled matching queue such as `Dai_Nippon_Printing_DS_RX1_2` when the exact base queue is disabled.
 - For the RX1HS, the requested output size still has to match the loaded media pack.
 - The bridge accepts either friendly sizes like `6x4` or raw CUPS media values like `300dnp6x4`.
 - By default the SQLite database is stored at `./data/dnp-print-bridge.sqlite`.
 - This project uses Node's built-in `node:sqlite`, which is currently marked experimental by Node.
+
+Submit the included sample image after the bridge is running:
+
+```bash
+npm run sample
+```
+
+This sends a real print job to the selected printer.
+
+Useful overrides:
+
+```bash
+BRIDGE_URL=http://127.0.0.1:3456
+PRINTER_NAME=Your_Printer_Queue_Name
+SAMPLE_FILE=/absolute/path/to/sample.jpeg
+SAMPLE_SIZE=6x4
+SAMPLE_COPIES=1
+AUTH_TOKEN=replace-me
+npm run sample
+```
 
 ## What Was Tested
 

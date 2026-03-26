@@ -11,7 +11,7 @@ const { DatabaseSync } = require("node:sqlite");
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 3456);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || "";
-const DEFAULT_PRINTER =
+const PRINTER_HINT =
   process.env.PRINTER_NAME || "Dai_Nippon_Printing_DS_RX1";
 const DEFAULT_MEDIA = process.env.DEFAULT_MEDIA || "";
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 25 * 1024 * 1024);
@@ -171,6 +171,109 @@ function normalizeFriendlyMedia(value) {
 function parseCupsRequestId(lpOutput) {
   const match = String(lpOutput || "").match(/request id is (\S+) \(/);
   return match ? match[1] : null;
+}
+
+function normalizePrinterToken(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function buildPrinterRecord(name, status) {
+  const normalizedStatus = String(status || "").trim();
+  return {
+    name,
+    status: normalizedStatus,
+    enabled: !/\bdisabled\b/i.test(normalizedStatus),
+    busy: /\bnow printing\b/i.test(normalizedStatus),
+  };
+}
+
+function scorePrinterMatch(printer, hint) {
+  if (!printer?.enabled) {
+    return -1;
+  }
+
+  const rawHint = String(hint || "").trim();
+  if (!rawHint) {
+    return 0;
+  }
+
+  const normalizedHint = normalizePrinterToken(rawHint);
+  if (!normalizedHint) {
+    return 0;
+  }
+
+  const normalizedName = normalizePrinterToken(printer.name);
+  const exactName = printer.name === rawHint;
+  const exactNormalized = normalizedName === normalizedHint;
+  const rawPrefix = printer.name.startsWith(rawHint);
+  const normalizedPrefix = normalizedName.startsWith(normalizedHint);
+  const rawContains =
+    printer.name.includes(rawHint) || rawHint.includes(printer.name);
+  const normalizedContains =
+    normalizedName.includes(normalizedHint) ||
+    normalizedHint.includes(normalizedName);
+
+  if (exactName) {
+    return 100;
+  }
+
+  if (exactNormalized) {
+    return 95;
+  }
+
+  if (rawPrefix) {
+    return 90;
+  }
+
+  if (normalizedPrefix) {
+    return 85;
+  }
+
+  if (rawContains) {
+    return 80;
+  }
+
+  if (normalizedContains) {
+    return 75;
+  }
+
+  return 0;
+}
+
+function selectPrinter(printers, hint = PRINTER_HINT) {
+  const availablePrinters = printers.filter((printer) => printer?.name);
+  const enabledPrinters = availablePrinters.filter((printer) => printer.enabled);
+
+  if (enabledPrinters.length === 0) {
+    return null;
+  }
+
+  const rankedMatches = enabledPrinters
+    .map((printer) => ({
+      printer,
+      score: scorePrinterMatch(printer, hint),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  if (rankedMatches.length > 0) {
+    return rankedMatches[0].printer;
+  }
+
+  if (enabledPrinters.length === 1) {
+    return enabledPrinters[0];
+  }
+
+  const dnpLikePrinters = enabledPrinters.filter((printer) =>
+    /\bdnp\b|dai[_ -]?nippon/i.test(printer.name)
+  );
+  if (dnpLikePrinters.length === 1) {
+    return dnpLikePrinters[0];
+  }
+
+  return null;
 }
 
 async function initDatabase() {
@@ -443,11 +546,37 @@ async function ensurePrintableFile(job) {
   });
 }
 
-function buildLpArgs(payload, filePath) {
-  const printer = payload.printer || DEFAULT_PRINTER;
-  if (!printer) {
-    throw new HttpError(400, "No printer specified and PRINTER_NAME is not set");
+async function resolvePrinterName(requestedPrinter = "") {
+  if (requestedPrinter) {
+    return requestedPrinter;
   }
+
+  const printers = await listPrinters();
+  const selectedPrinter = selectPrinter(printers, PRINTER_HINT);
+  if (selectedPrinter) {
+    return selectedPrinter.name;
+  }
+
+  if (PRINTER_HINT) {
+    throw new HttpError(
+      503,
+      `No enabled printer found matching "${PRINTER_HINT}"`
+    );
+  }
+
+  throw new HttpError(503, "No enabled printer found");
+}
+
+async function getResolvedDefaultPrinter() {
+  try {
+    return await resolvePrinterName();
+  } catch {
+    return null;
+  }
+}
+
+async function buildLpArgs(payload, filePath) {
+  const printer = await resolvePrinterName(payload.printer);
 
   const args = ["-d", printer];
   const jobName = sanitizeJobName(payload.jobName);
@@ -484,20 +613,39 @@ async function listPrinters() {
     throw new HttpError(500, result.stderr || "lpstat -p failed");
   }
 
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const match = line.match(/^printer\s+(\S+)\s+is\s+(.+)$/);
-      if (!match) {
-        return { raw: line };
-      }
-      return {
-        name: match[1],
-        status: match[2],
-      };
-    });
+  const printers = [];
+  let currentPrinter = null;
+
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+
+    const match = trimmed.match(/^printer\s+(\S+)\s+(.+)$/);
+    if (match) {
+      currentPrinter = buildPrinterRecord(match[1], match[2]);
+      printers.push(currentPrinter);
+      continue;
+    }
+
+    if (currentPrinter && /^\s+/.test(line)) {
+      Object.assign(
+        currentPrinter,
+        buildPrinterRecord(
+          currentPrinter.name,
+          `${currentPrinter.status} ${trimmed}`
+        )
+      );
+      continue;
+    }
+
+    printers.push({ raw: trimmed });
+    currentPrinter = null;
+  }
+
+  return printers;
 }
 
 async function listOutstandingCupsJobs(printer) {
@@ -588,7 +736,10 @@ async function runJob(job, options = {}) {
       });
 
       await ensurePrintableFile(job);
-      const submission = buildLpArgs(job.payload, job.filePath);
+      const submission = await buildLpArgs(job.payload, job.filePath);
+      updateJob(job, {
+        printer: submission.printer,
+      });
       const result = await spawnAndCollect("lp", submission.args);
 
       if (result.code !== 0) {
@@ -782,7 +933,11 @@ async function handlePrint(req, res) {
   assertAuthorized(req);
   const payload = await readJsonBody(req);
   const written = await writePrintFile(payload);
-  const preview = buildLpArgs(payload, written.filePath);
+  const preview = await buildLpArgs(payload, written.filePath);
+  const storedPayload = {
+    ...payload,
+    printer: preview.printer,
+  };
   const now = new Date().toISOString();
   const job = {
     id: randomUUID(),
@@ -793,7 +948,7 @@ async function handlePrint(req, res) {
     copies: preview.copies,
     requestedSize: payload.size || payload.media || DEFAULT_MEDIA || "",
     media: preview.media || "",
-    payload,
+    payload: storedPayload,
     filePath: written.filePath,
     cleanupDir: written.cleanupDir,
     cupsRequestId: null,
@@ -843,11 +998,13 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/health") {
+      const resolvedPrinter = await getResolvedDefaultPrinter();
       sendJson(res, 200, {
         ok: true,
         host: HOST,
         port: PORT,
-        defaultPrinter: DEFAULT_PRINTER,
+        printerHint: PRINTER_HINT,
+        defaultPrinter: resolvedPrinter,
         defaultMedia: DEFAULT_MEDIA,
         authEnabled: Boolean(AUTH_TOKEN),
         dbPath: DB_PATH,
@@ -862,9 +1019,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/printers") {
       assertAuthorized(req);
+      const resolvedPrinter = await getResolvedDefaultPrinter();
       sendJson(res, 200, {
         ok: true,
-        defaultPrinter: DEFAULT_PRINTER,
+        printerHint: PRINTER_HINT,
+        defaultPrinter: resolvedPrinter,
         printers: await listPrinters(),
       });
       return;
@@ -901,7 +1060,7 @@ async function main() {
   await restoreJobsFromDatabase();
   server.listen(PORT, HOST, () => {
     console.log(
-      `dnp-print-bridge listening on http://${HOST}:${PORT} using printer "${DEFAULT_PRINTER}"`
+      `dnp-print-bridge listening on http://${HOST}:${PORT} using printer hint "${PRINTER_HINT}"`
     );
     console.log(`sqlite database: ${DB_PATH}`);
   });
