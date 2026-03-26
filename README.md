@@ -39,8 +39,9 @@ node server.js
 
 Notes:
 
-- Keep `HOST=127.0.0.1` if only the local Mac should call it.
-- Use `HOST=0.0.0.0` plus `AUTH_TOKEN` if your Android tablet will call it over LAN.
+- The default bind host is `0.0.0.0`, so other machines on the network can call the bridge.
+- Set `HOST=127.0.0.1` if only the local Mac should call it.
+- Use `AUTH_TOKEN` if anything outside the local machine will call it.
 - `PRINTER_NAME` is optional and acts as a hint. The bridge will try to pick an enabled matching queue such as `Dai_Nippon_Printing_DS_RX1_2` when the exact base queue is disabled.
 - For the RX1HS, the requested output size still has to match the loaded media pack.
 - The bridge accepts either friendly sizes like `6x4` or raw CUPS media values like `300dnp6x4`.
