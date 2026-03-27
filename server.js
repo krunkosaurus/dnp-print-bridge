@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
-const { DatabaseSync } = require("node:sqlite");
+
+let DatabaseSync = null;
+try {
+  ({ DatabaseSync } = require("node:sqlite"));
+} catch {
+  DatabaseSync = null;
+}
 
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3456);
@@ -18,9 +25,15 @@ const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 25 * 1024 * 1024);
 const TMP_ROOT = process.env.TMPDIR || os.tmpdir();
 const JOB_POLL_MS = Number(process.env.JOB_POLL_MS || 2000);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 20 * 60 * 1000);
+const DB_BACKEND =
+  process.env.DB_BACKEND || (DatabaseSync ? "sqlite" : "json");
 const DB_PATH =
   process.env.DB_PATH ||
-  path.join(__dirname, "data", "dnp-print-bridge.sqlite");
+  path.join(
+    __dirname,
+    "data",
+    DB_BACKEND === "sqlite" ? "dnp-print-bridge.sqlite" : "dnp-print-bridge.json"
+  );
 const STATS_RECENT_LIMIT = Number(process.env.STATS_RECENT_LIMIT || 20);
 
 const MIME_EXTENSIONS = {
@@ -42,6 +55,16 @@ const FRIENDLY_MEDIA_MAP = {
   "8x6": "310dnp6x8",
 };
 
+const FRIENDLY_PAGE_SIZE_MAP = {
+  "4x6": "w288h432",
+  "6x4": "w288h432",
+  "5x5": "w360h360",
+  "5x7": "w360h504",
+  "6x6": "w432h432",
+  "6x8": "w432h576",
+  "8x6": "w432h576",
+};
+
 class HttpError extends Error {
   constructor(statusCode, message) {
     super(message);
@@ -50,7 +73,8 @@ class HttpError extends Error {
   }
 }
 
-let db;
+let sqliteDb;
+let jsonStore = { jobs: {} };
 let nextQueueOrder = 1;
 const jobs = new Map();
 const queuedJobIds = [];
@@ -168,6 +192,16 @@ function normalizeFriendlyMedia(value) {
   return FRIENDLY_MEDIA_MAP[normalized] || raw;
 }
 
+function normalizeFriendlyPageSize(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  const normalized = raw.toLowerCase().replace(/\s+/g, "");
+  return FRIENDLY_PAGE_SIZE_MAP[normalized] || raw;
+}
+
 function parseCupsRequestId(lpOutput) {
   const match = String(lpOutput || "").match(/request id is (\S+) \(/);
   return match ? match[1] : null;
@@ -278,117 +312,205 @@ function selectPrinter(printers, hint = PRINTER_HINT) {
 
 async function initDatabase() {
   await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
-  db = new DatabaseSync(DB_PATH);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      queue_order INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      printer TEXT NOT NULL,
-      job_name TEXT NOT NULL,
-      copies INTEGER NOT NULL,
-      requested_size TEXT,
-      media TEXT,
-      payload_json TEXT NOT NULL,
-      file_path TEXT,
-      cleanup_dir TEXT,
-      cups_request_id TEXT,
-      error TEXT,
-      created_at TEXT NOT NULL,
-      started_at TEXT,
-      completed_at TEXT,
-      is_terminal INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_jobs_queue_order ON jobs(queue_order);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-    CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at);
-  `);
+  if (DB_BACKEND === "sqlite") {
+    sqliteDb = new DatabaseSync(DB_PATH);
+    sqliteDb.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        queue_order INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        printer TEXT NOT NULL,
+        job_name TEXT NOT NULL,
+        copies INTEGER NOT NULL,
+        requested_size TEXT,
+        media TEXT,
+        payload_json TEXT NOT NULL,
+        file_path TEXT,
+        cleanup_dir TEXT,
+        cups_request_id TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        is_terminal INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_jobs_queue_order ON jobs(queue_order);
+      CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+      CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at);
+    `);
+  } else if (fsSync.existsSync(DB_PATH)) {
+    const raw = fsSync.readFileSync(DB_PATH, "utf8").trim();
+    jsonStore = raw ? JSON.parse(raw) : { jobs: {} };
+  } else {
+    jsonStore = { jobs: {} };
+    writeJsonStore();
+  }
 
-  const row = db
-    .prepare("SELECT COALESCE(MAX(queue_order), 0) + 1 AS next_queue_order FROM jobs")
-    .get();
-  nextQueueOrder = Number(row.next_queue_order || 1);
+  const persistedJobs = loadPersistedJobs();
+  const highestQueueOrder = persistedJobs.reduce(
+    (max, job) => Math.max(max, Number(job.queueOrder || 0)),
+    0
+  );
+  nextQueueOrder = highestQueueOrder + 1;
+}
+
+function serializeJob(job) {
+  return {
+    id: job.id,
+    queueOrder: Number(job.queueOrder),
+    status: job.status,
+    printer: job.printer,
+    jobName: job.jobName,
+    copies: Number(job.copies),
+    requestedSize: job.requestedSize || "",
+    media: job.media || "",
+    payload: job.payload,
+    filePath: job.filePath || null,
+    cleanupDir: job.cleanupDir || null,
+    cupsRequestId: job.cupsRequestId || null,
+    error: job.error || null,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt || null,
+    completedAt: job.completedAt || null,
+    isTerminal: Boolean(job.isTerminal),
+  };
+}
+
+function hydrateJsonJob(record) {
+  return {
+    id: record.id,
+    queueOrder: Number(record.queueOrder),
+    status: record.status,
+    printer: record.printer,
+    jobName: record.jobName,
+    copies: Number(record.copies),
+    requestedSize: record.requestedSize || "",
+    media: record.media || "",
+    payload: record.payload,
+    filePath: record.filePath || null,
+    cleanupDir: record.cleanupDir || null,
+    cupsRequestId: record.cupsRequestId || null,
+    error: record.error || null,
+    createdAt: record.createdAt,
+    startedAt: record.startedAt || null,
+    completedAt: record.completedAt || null,
+    isTerminal: Boolean(record.isTerminal),
+  };
+}
+
+function compareJobs(left, right) {
+  return (
+    Number(left.queueOrder) - Number(right.queueOrder) ||
+    String(left.createdAt || "").localeCompare(String(right.createdAt || ""))
+  );
+}
+
+function writeJsonStore() {
+  const tempPath = `${DB_PATH}.tmp`;
+  fsSync.writeFileSync(tempPath, JSON.stringify(jsonStore, null, 2));
+  fsSync.renameSync(tempPath, DB_PATH);
+}
+
+function loadPersistedJobs() {
+  if (DB_BACKEND === "sqlite") {
+    return sqliteDb
+      .prepare("SELECT * FROM jobs ORDER BY queue_order ASC, created_at ASC")
+      .all()
+      .map(hydrateJob);
+  }
+
+  return Object.values(jsonStore.jobs || {})
+    .map(hydrateJsonJob)
+    .sort(compareJobs);
 }
 
 function persistJob(job) {
-  db.prepare(
-    `
-      INSERT INTO jobs (
-        id,
-        queue_order,
-        status,
-        printer,
-        job_name,
-        copies,
-        requested_size,
-        media,
-        payload_json,
-        file_path,
-        cleanup_dir,
-        cups_request_id,
-        error,
-        created_at,
-        started_at,
-        completed_at,
-        is_terminal
-      ) VALUES (
-        @id,
-        @queue_order,
-        @status,
-        @printer,
-        @job_name,
-        @copies,
-        @requested_size,
-        @media,
-        @payload_json,
-        @file_path,
-        @cleanup_dir,
-        @cups_request_id,
-        @error,
-        @created_at,
-        @started_at,
-        @completed_at,
-        @is_terminal
+  if (DB_BACKEND === "sqlite") {
+    sqliteDb
+      .prepare(
+        `
+          INSERT INTO jobs (
+            id,
+            queue_order,
+            status,
+            printer,
+            job_name,
+            copies,
+            requested_size,
+            media,
+            payload_json,
+            file_path,
+            cleanup_dir,
+            cups_request_id,
+            error,
+            created_at,
+            started_at,
+            completed_at,
+            is_terminal
+          ) VALUES (
+            @id,
+            @queue_order,
+            @status,
+            @printer,
+            @job_name,
+            @copies,
+            @requested_size,
+            @media,
+            @payload_json,
+            @file_path,
+            @cleanup_dir,
+            @cups_request_id,
+            @error,
+            @created_at,
+            @started_at,
+            @completed_at,
+            @is_terminal
+          )
+          ON CONFLICT(id) DO UPDATE SET
+            queue_order = excluded.queue_order,
+            status = excluded.status,
+            printer = excluded.printer,
+            job_name = excluded.job_name,
+            copies = excluded.copies,
+            requested_size = excluded.requested_size,
+            media = excluded.media,
+            payload_json = excluded.payload_json,
+            file_path = excluded.file_path,
+            cleanup_dir = excluded.cleanup_dir,
+            cups_request_id = excluded.cups_request_id,
+            error = excluded.error,
+            created_at = excluded.created_at,
+            started_at = excluded.started_at,
+            completed_at = excluded.completed_at,
+            is_terminal = excluded.is_terminal
+        `
       )
-      ON CONFLICT(id) DO UPDATE SET
-        queue_order = excluded.queue_order,
-        status = excluded.status,
-        printer = excluded.printer,
-        job_name = excluded.job_name,
-        copies = excluded.copies,
-        requested_size = excluded.requested_size,
-        media = excluded.media,
-        payload_json = excluded.payload_json,
-        file_path = excluded.file_path,
-        cleanup_dir = excluded.cleanup_dir,
-        cups_request_id = excluded.cups_request_id,
-        error = excluded.error,
-        created_at = excluded.created_at,
-        started_at = excluded.started_at,
-        completed_at = excluded.completed_at,
-        is_terminal = excluded.is_terminal
-    `
-  ).run({
-    id: job.id,
-    queue_order: job.queueOrder,
-    status: job.status,
-    printer: job.printer,
-    job_name: job.jobName,
-    copies: job.copies,
-    requested_size: job.requestedSize || "",
-    media: job.media || "",
-    payload_json: JSON.stringify(job.payload),
-    file_path: job.filePath || null,
-    cleanup_dir: job.cleanupDir || null,
-    cups_request_id: job.cupsRequestId || null,
-    error: job.error || null,
-    created_at: job.createdAt,
-    started_at: job.startedAt || null,
-    completed_at: job.completedAt || null,
-    is_terminal: job.isTerminal ? 1 : 0,
-  });
+      .run({
+        id: job.id,
+        queue_order: job.queueOrder,
+        status: job.status,
+        printer: job.printer,
+        job_name: job.jobName,
+        copies: job.copies,
+        requested_size: job.requestedSize || "",
+        media: job.media || "",
+        payload_json: JSON.stringify(job.payload),
+        file_path: job.filePath || null,
+        cleanup_dir: job.cleanupDir || null,
+        cups_request_id: job.cupsRequestId || null,
+        error: job.error || null,
+        created_at: job.createdAt,
+        started_at: job.startedAt || null,
+        completed_at: job.completedAt || null,
+        is_terminal: job.isTerminal ? 1 : 0,
+      });
+    return;
+  }
+
+  jsonStore.jobs[job.id] = serializeJob(job);
+  writeJsonStore();
 }
 
 function hydrateJob(row) {
@@ -575,6 +697,36 @@ async function getResolvedDefaultPrinter() {
   }
 }
 
+async function getPrinterOptionChoices(printer) {
+  const result = await spawnAndCollect("lpoptions", ["-p", printer, "-l"]);
+  if (result.code !== 0) {
+    return {};
+  }
+
+  const choicesByOption = {};
+
+  for (const rawLine of result.stdout.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || !line.includes(":")) {
+      continue;
+    }
+
+    const [descriptor, values] = line.split(":", 2);
+    const optionName = descriptor.split("/", 1)[0].trim();
+    if (!optionName || !values) {
+      continue;
+    }
+
+    choicesByOption[optionName] = values
+      .trim()
+      .split(/\s+/)
+      .map((value) => value.replace(/^\*/, ""))
+      .filter(Boolean);
+  }
+
+  return choicesByOption;
+}
+
 async function buildLpArgs(payload, filePath) {
   const printer = await resolvePrinterName(payload.printer);
 
@@ -589,10 +741,15 @@ async function buildLpArgs(payload, filePath) {
   args.push("-n", String(copies));
 
   const options = { ...(payload.options || {}) };
-  const media = normalizeFriendlyMedia(
-    payload.media || payload.size || DEFAULT_MEDIA
-  );
-  if (media) {
+  const requestedOutput = payload.media || payload.size || DEFAULT_MEDIA;
+  const media = normalizeFriendlyMedia(requestedOutput);
+  const pageSize = normalizeFriendlyPageSize(requestedOutput);
+  const optionChoices = await getPrinterOptionChoices(printer);
+  const supportedPageSizes = new Set(optionChoices.PageSize || []);
+
+  if (pageSize && supportedPageSizes.has(pageSize)) {
+    options.PageSize = pageSize;
+  } else if (media) {
     options.media = media;
   }
 
@@ -604,7 +761,13 @@ async function buildLpArgs(payload, filePath) {
   }
 
   args.push(filePath);
-  return { printer, args, media, jobName, copies };
+  return {
+    printer,
+    args,
+    media: options.PageSize || media,
+    jobName,
+    copies,
+  };
 }
 
 async function listPrinters() {
@@ -800,9 +963,7 @@ async function restoreJobsFromDatabase() {
   queuedJobIds.length = 0;
   activeJobId = null;
 
-  const rows = db
-    .prepare("SELECT * FROM jobs ORDER BY queue_order ASC, created_at ASC")
-    .all();
+  const persistedJobs = loadPersistedJobs();
   const outstandingCache = new Map();
 
   async function getOutstanding(printer) {
@@ -812,8 +973,7 @@ async function restoreJobsFromDatabase() {
     return outstandingCache.get(printer);
   }
 
-  for (const row of rows) {
-    const job = hydrateJob(row);
+  for (const job of persistedJobs) {
     jobs.set(job.id, job);
   }
 
@@ -880,49 +1040,55 @@ async function restoreJobsFromDatabase() {
 }
 
 function getStats(limit = STATS_RECENT_LIMIT) {
-  const totals = db
-    .prepare(
-      `
-        SELECT
-          COUNT(*) AS total_jobs,
-          COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_jobs,
-          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_jobs,
-          COALESCE(SUM(CASE WHEN status IN ('queued', 'submitting', 'printing') THEN 1 ELSE 0 END), 0) AS open_jobs
-        FROM jobs
-      `
-    )
-    .get();
+  const allJobs = Array.from(jobs.values());
+  const totals = allJobs.reduce(
+    (acc, job) => {
+      acc.totalJobs += 1;
+      if (job.status === "completed") {
+        acc.completedJobs += 1;
+      } else if (job.status === "failed") {
+        acc.failedJobs += 1;
+      } else if (["queued", "submitting", "printing"].includes(job.status)) {
+        acc.openJobs += 1;
+      }
+      return acc;
+    },
+    {
+      totalJobs: 0,
+      completedJobs: 0,
+      failedJobs: 0,
+      openJobs: 0,
+    }
+  );
 
-  const recentJobs = db
-    .prepare(
-      `
-        SELECT
-          id,
-          status,
-          printer,
-          job_name,
-          copies,
-          requested_size,
-          media,
-          cups_request_id,
-          created_at,
-          started_at,
-          completed_at,
-          error
-        FROM jobs
-        ORDER BY queue_order DESC
-        LIMIT ?
-      `
-    )
-    .all(limit)
-    .map(buildRecentJobResponse);
+  const recentJobs = allJobs
+    .slice()
+    .sort((left, right) => compareJobs(right, left))
+    .slice(0, limit)
+    .map((job) =>
+      buildRecentJobResponse({
+        id: job.id,
+        status: job.status,
+        printer: job.printer,
+        job_name: job.jobName,
+        copies: job.copies,
+        requested_size: job.requestedSize,
+        media: job.media,
+        cups_request_id: job.cupsRequestId,
+        created_at: job.createdAt,
+        started_at: job.startedAt,
+        completed_at: job.completedAt,
+        error: job.error,
+      })
+    );
 
   return {
+    dbBackend: DB_BACKEND,
     dbPath: DB_PATH,
-    totalJobs: Number(totals.total_jobs),
-    completedJobs: Number(totals.completed_jobs),
-    failedJobs: Number(totals.failed_jobs),
-    openJobs: Number(totals.open_jobs),
+    totalJobs: totals.totalJobs,
+    completedJobs: totals.completedJobs,
+    failedJobs: totals.failedJobs,
+    openJobs: totals.openJobs,
     activeJobId,
     queuedJobs: queuedJobIds.length,
     recentJobs,
@@ -1007,6 +1173,7 @@ const server = http.createServer(async (req, res) => {
         defaultPrinter: resolvedPrinter,
         defaultMedia: DEFAULT_MEDIA,
         authEnabled: Boolean(AUTH_TOKEN),
+        dbBackend: DB_BACKEND,
         dbPath: DB_PATH,
         queue: {
           activeJobId,

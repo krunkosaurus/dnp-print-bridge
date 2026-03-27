@@ -2,7 +2,7 @@
   "name": "dnp-print-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "Small HTTP bridge for silent printing to a macOS CUPS queue.",
+  "description": "Small HTTP bridge for silent printing to a local CUPS queue.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

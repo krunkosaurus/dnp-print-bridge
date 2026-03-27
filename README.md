@@ -1,6 +1,6 @@
 # DNP Print Bridge
 
-Small Node.js HTTP service for printing to a DNP printer on macOS from your own code.
+Small Node.js HTTP service for printing to a DNP printer through a local CUPS queue from your own code.
 
 It was written and tested for:
 
@@ -14,9 +14,9 @@ The goal is simple:
 - print jobs one after another in order
 - do it without showing the normal macOS print dialog
 
-In plain terms, this is a small local print server for your Mac. Your other apps can call it to queue photo prints automatically and quietly in the background.
+In plain terms, this is a small local print server for a machine that has the printer attached through CUPS. Your other apps can call it to queue photo prints automatically and quietly in the background.
 
-The queue is persisted in SQLite, so the bridge can recover job history and in-flight jobs after a restart or crash.
+The queue is persisted locally so the bridge can recover job history and in-flight jobs after a restart or crash. On newer Node.js versions it uses SQLite; on older environments without `node:sqlite` it falls back to a JSON file.
 
 ## Run
 
@@ -33,6 +33,7 @@ PORT=3456
 PRINTER_NAME=Your_Printer_Queue_Name_Or_Prefix
 DEFAULT_MEDIA=4x6
 AUTH_TOKEN=replace-me
+DB_BACKEND=sqlite
 DB_PATH=/path/to/dnp-print-bridge.sqlite
 node server.js
 ```
@@ -46,12 +47,31 @@ Notes:
 - For the RX1HS, the requested output size still has to match the loaded media pack.
 - The bridge accepts either friendly sizes like `6x4` or raw CUPS media values like `300dnp6x4`.
 - By default the SQLite database is stored at `./data/dnp-print-bridge.sqlite`.
-- This project uses Node's built-in `node:sqlite`, which is currently marked experimental by Node.
+- `DB_BACKEND` defaults to `sqlite` when `node:sqlite` is available, otherwise it falls back to `json`.
+- If you use `DB_BACKEND=json`, set `DB_PATH` to a `.json` file path for clarity.
 
 Submit the included sample image after the bridge is running:
 
 ```bash
 npm run sample
+```
+
+## Raspberry Pi Deployment
+
+For older Raspberry Pi hardware that cannot run a recent enough Node.js build for `node:sqlite`, this bridge can run with:
+
+- `Node.js 18`
+- `DB_BACKEND=json`
+- Gutenprint / CUPS queue `DNP_DSRX1`
+
+The systemd unit used on the Pi is included at `deploy/systemd/dnp-print-bridge.service`.
+
+Typical setup on the Pi:
+
+```bash
+sudo cp deploy/systemd/dnp-print-bridge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dnp-print-bridge
 ```
 
 This sends a real print job to the selected printer.
@@ -79,7 +99,7 @@ The following end-to-end flow was tested successfully:
 
 The project was tested with a real DNP queue on macOS and accepted by CUPS.
 
-This does not mean every DNP model or every macOS printer driver variant will behave identically. You should verify the media names exposed by your own queue with:
+This does not mean every DNP model or every macOS or Linux printer driver variant will behave identically. You should verify the media names exposed by your own queue with:
 
 ```bash
 lpoptions -p YOUR_PRINTER_QUEUE -l
