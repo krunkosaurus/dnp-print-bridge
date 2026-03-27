@@ -66,13 +66,114 @@ For older Raspberry Pi hardware that cannot run a recent enough Node.js build fo
 
 The systemd unit used on the Pi is included at `deploy/systemd/dnp-print-bridge.service`.
 
-Typical setup on the Pi:
+The steps below match the setup that was verified on an older ARMv6 Raspberry Pi with a `DNP DS-RX1` attached over USB.
+
+### 1. Install system packages
+
+```bash
+sudo apt-get update
+sudo apt-get -y full-upgrade
+sudo apt-get -y install git curl ca-certificates xz-utils cups cups-bsd printer-driver-gutenprint
+```
+
+### 2. Confirm the printer is visible over USB
+
+```bash
+lsusb
+dmesg | egrep -i 'usblp|dnp|citizen|printer'
+```
+
+Expected USB identity for this setup looked like:
+
+- `Citizen Systems CY / DNP DSRX1`
+
+### 3. Install a Node.js build that works on older ARMv6 Pis
+
+The stock or NodeSource build on older Pis may fail with `Illegal instruction`. This ARMv6 build was verified:
+
+```bash
+NODE_VERSION=v18.20.8
+cd /tmp
+curl -fsSLO https://unofficial-builds.nodejs.org/download/release/${NODE_VERSION}/node-${NODE_VERSION}-linux-armv6l.tar.xz
+sudo mkdir -p /opt/node-${NODE_VERSION}
+sudo tar -xJf node-${NODE_VERSION}-linux-armv6l.tar.xz -C /opt/node-${NODE_VERSION} --strip-components=1
+sudo ln -sfn /opt/node-${NODE_VERSION}/bin/node /usr/local/bin/node
+sudo ln -sfn /opt/node-${NODE_VERSION}/bin/npm /usr/local/bin/npm
+sudo ln -sfn /opt/node-${NODE_VERSION}/bin/npx /usr/local/bin/npx
+node -v
+npm -v
+```
+
+### 4. Copy the repo onto the Pi
+
+```bash
+cd /home/pi
+git clone YOUR_REPO_URL dnp-print-bridge
+cd dnp-print-bridge
+```
+
+Or copy it from another machine with `rsync`.
+
+### 5. Create the CUPS queue
+
+Find the printer backend URI:
+
+```bash
+/usr/sbin/lpinfo -v
+```
+
+For the verified setup, the printer URI was:
+
+```bash
+gutenprint53+usb://dnp-dsrx1/CB2D5B205630
+```
+
+Create the queue:
+
+```bash
+sudo /usr/sbin/lpadmin -x DNP_DSRX1 2>/dev/null || true
+sudo /usr/sbin/lpadmin \
+  -p DNP_DSRX1 \
+  -E \
+  -v "gutenprint53+usb://dnp-dsrx1/CB2D5B205630" \
+  -m "gutenprint.5.3://dnp-dsrx1/expert"
+sudo lpadmin -d DNP_DSRX1
+```
+
+Check the queue:
+
+```bash
+lpstat -t
+lpoptions -p DNP_DSRX1 -l | grep '^PageSize/'
+```
+
+On the verified Pi, Gutenprint exposed `PageSize` values such as:
+
+- `w288h432` for `6x4`
+- `w360h504` for `5x7`
+- `w432h576` for `6x8`
+
+The bridge now maps friendly sizes like `6x4` to those Gutenprint `PageSize` values automatically when needed.
+
+### 6. Install the systemd service
+
+From the repo root:
 
 ```bash
 sudo cp deploy/systemd/dnp-print-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dnp-print-bridge
 ```
+
+Check service state:
+
+```bash
+systemctl status dnp-print-bridge --no-pager
+curl http://127.0.0.1:3456/health
+curl http://127.0.0.1:3456/printers
+```
+
+### 7. Optional real print test
 
 This sends a real print job to the selected printer.
 
@@ -86,6 +187,21 @@ SAMPLE_SIZE=6x4
 SAMPLE_COPIES=1
 AUTH_TOKEN=replace-me
 npm run sample
+```
+
+Or submit a request directly:
+
+```bash
+curl \
+  -X POST http://127.0.0.1:3456/print \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "filePath": "/home/pi/dnp-print-bridge/sample.jpeg",
+    "jobName": "pi-sample-6x4",
+    "size": "6x4",
+    "copies": 1,
+    "printer": "DNP_DSRX1"
+  }'
 ```
 
 ## What Was Tested
