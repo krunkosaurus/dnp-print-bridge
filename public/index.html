@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DNP Print Bridge</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <div class="ambient ambient-left"></div>
+    <div class="ambient ambient-right"></div>
+
+    <main class="shell">
+      <header class="topbar glass">
+        <div>
+          <p class="eyebrow">Venue Printer Diagnostics</p>
+          <h1>DNP Print Bridge</h1>
+        </div>
+        <div class="live-pill" id="live-pill">
+          <span class="live-dot"></span>
+          <span id="live-label">ONLINE</span>
+        </div>
+      </header>
+
+      <section class="hero glass">
+        <div class="hero-copy">
+          <p class="eyebrow">Current Status</p>
+          <div class="status-row">
+            <h2 id="status-text">READY</h2>
+            <div class="status-wave" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          </div>
+          <p class="status-detail" id="status-detail">
+            Listening for the next print request.
+          </p>
+
+          <div class="ip-card">
+            <span class="ip-label">Tailscale</span>
+            <strong id="tailscale-ip">Checking…</strong>
+          </div>
+        </div>
+
+        <div class="hero-stage">
+          <div class="preview-shell">
+            <img id="preview-image" alt="Current print preview">
+            <div class="preview-ready" id="preview-ready">
+              <div class="ready-ring"></div>
+              <div class="ready-core">
+                <span class="ready-label">Status</span>
+                <strong>READY</strong>
+              </div>
+            </div>
+            <div class="preview-meta" id="preview-meta">No active print job</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="metrics">
+        <article class="metric glass">
+          <span class="metric-label">Printed Today</span>
+          <strong class="metric-value" id="printed-today">0</strong>
+          <span class="metric-note">Completed jobs since local midnight</span>
+        </article>
+
+        <article class="metric glass">
+          <span class="metric-label">Printer Queue</span>
+          <strong class="metric-value metric-text" id="printer-name">Checking…</strong>
+          <span class="metric-note" id="printer-status">Waiting for printer data</span>
+        </article>
+
+        <article class="metric glass">
+          <span class="metric-label">Open Jobs</span>
+          <strong class="metric-value" id="open-jobs">0</strong>
+          <span class="metric-note" id="queue-detail">Queue is idle</span>
+        </article>
+
+        <article class="metric glass">
+          <span class="metric-label">Local Time</span>
+          <strong class="metric-value metric-text" id="local-time">--:--:--</strong>
+          <span class="metric-note" id="updated-at">Awaiting bridge state</span>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

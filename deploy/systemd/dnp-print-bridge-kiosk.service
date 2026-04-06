@@ -1,0 +1,18 @@
+[Unit]
+Description=DNP Print Bridge Kiosk
+After=graphical.target network-online.target dnp-print-bridge.service
+Wants=graphical.target network-online.target
+Requires=dnp-print-bridge.service
+
+[Service]
+Type=simple
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+WorkingDirectory=/home/pi/dnp-print-bridge
+ExecStart=/home/pi/dnp-print-bridge/deploy/scripts/start-kiosk.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

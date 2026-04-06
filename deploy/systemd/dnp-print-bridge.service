@@ -13,6 +13,7 @@ Environment=PORT=3456
 Environment=PRINTER_NAME=DNP_DSRX1
 Environment=DB_BACKEND=json
 ExecStart=/usr/local/bin/node /home/pi/dnp-print-bridge/server.js
+Environment=UI_PREVIEW_MS=10000
 Restart=on-failure
 RestartSec=3
 

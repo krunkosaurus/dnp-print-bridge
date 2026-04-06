@@ -9,10 +9,12 @@ const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
 
 let DatabaseSync = null;
-try {
-  ({ DatabaseSync } = require("node:sqlite"));
-} catch {
-  DatabaseSync = null;
+if (process.env.DB_BACKEND !== "json") {
+  try {
+    ({ DatabaseSync } = require("node:sqlite"));
+  } catch {
+    DatabaseSync = null;
+  }
 }
 
 const HOST = process.env.HOST || "0.0.0.0";
@@ -25,6 +27,7 @@ const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 25 * 1024 * 1024);
 const TMP_ROOT = process.env.TMPDIR || os.tmpdir();
 const JOB_POLL_MS = Number(process.env.JOB_POLL_MS || 2000);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 20 * 60 * 1000);
+const UI_PREVIEW_MS = Number(process.env.UI_PREVIEW_MS || 10 * 1000);
 const DB_BACKEND =
   process.env.DB_BACKEND || (DatabaseSync ? "sqlite" : "json");
 const DB_PATH =
@@ -35,12 +38,26 @@ const DB_PATH =
     DB_BACKEND === "sqlite" ? "dnp-print-bridge.sqlite" : "dnp-print-bridge.json"
   );
 const STATS_RECENT_LIMIT = Number(process.env.STATS_RECENT_LIMIT || 20);
+const PUBLIC_ROOT = path.join(__dirname, "public");
 
 const MIME_EXTENSIONS = {
   "application/pdf": ".pdf",
   "image/jpeg": ".jpg",
   "image/jpg": ".jpg",
   "image/png": ".png",
+};
+
+const FILE_CONTENT_TYPES = {
+  ".css": "text/css; charset=utf-8",
+  ".gif": "image/gif",
+  ".html": "text/html; charset=utf-8",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".js": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml; charset=utf-8",
+  ".webp": "image/webp",
 };
 
 const FRIENDLY_MEDIA_MAP = {
@@ -80,6 +97,12 @@ const jobs = new Map();
 const queuedJobIds = [];
 let activeJobId = null;
 let queueWorkerRunning = false;
+let activePreview = null;
+let previewTimer = null;
+let tailscaleIpCache = {
+  fetchedAt: 0,
+  ips: [],
+};
 
 function sendJson(res, statusCode, body) {
   const payload = JSON.stringify(body, null, 2);
@@ -156,6 +179,11 @@ function assertAuthorized(req) {
 
 function extensionForMime(contentType) {
   return MIME_EXTENSIONS[String(contentType || "").toLowerCase()] || ".bin";
+}
+
+function contentTypeForFilePath(filePath) {
+  return FILE_CONTENT_TYPES[path.extname(String(filePath || "")).toLowerCase()] ||
+    "application/octet-stream";
 }
 
 function normalizeBase64(input) {
@@ -407,6 +435,120 @@ function compareJobs(left, right) {
   );
 }
 
+function formatLocalDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function getPrintedTodayCount() {
+  const todayKey = formatLocalDateKey(new Date());
+  return Array.from(jobs.values()).filter((job) => {
+    if (job.status !== "completed" || !job.completedAt) {
+      return false;
+    }
+
+    const completedAt = new Date(job.completedAt);
+    if (Number.isNaN(completedAt.getTime())) {
+      return false;
+    }
+
+    return formatLocalDateKey(completedAt) === todayKey;
+  }).length;
+}
+
+function clearActivePreview() {
+  if (!activePreview) {
+    return;
+  }
+
+  const expiredPreview = activePreview;
+  activePreview = null;
+
+  const job = jobs.get(expiredPreview.jobId);
+  if (job?.isTerminal) {
+    finalizeJobFile(job);
+  }
+}
+
+function getActivePreview() {
+  if (!activePreview) {
+    return null;
+  }
+
+  if (Date.now() >= activePreview.expiresAt) {
+    clearActivePreview();
+    return null;
+  }
+
+  return activePreview;
+}
+
+function schedulePreviewExpiry() {
+  if (previewTimer) {
+    clearTimeout(previewTimer);
+    previewTimer = null;
+  }
+
+  const preview = getActivePreview();
+  if (!preview) {
+    return;
+  }
+
+  previewTimer = setTimeout(() => {
+    previewTimer = null;
+    clearActivePreview();
+  }, Math.max(0, preview.expiresAt - Date.now()) + 25);
+}
+
+function rememberPreview(job) {
+  const existingPreview = getActivePreview();
+  if (existingPreview && existingPreview.jobId !== job.id) {
+    const existingJob = jobs.get(existingPreview.jobId);
+    activePreview = null;
+    if (existingJob?.isTerminal) {
+      finalizeJobFile(existingJob);
+    }
+  }
+
+  activePreview = {
+    jobId: job.id,
+    filePath: job.filePath,
+    contentType: contentTypeForFilePath(job.filePath),
+    expiresAt: Date.now() + UI_PREVIEW_MS,
+  };
+  schedulePreviewExpiry();
+}
+
+function previewRetainsJobFile(job) {
+  const preview = getActivePreview();
+  return Boolean(preview && preview.jobId === job.id && preview.filePath === job.filePath);
+}
+
+async function getTailscaleIps() {
+  const now = Date.now();
+  if (now - tailscaleIpCache.fetchedAt < 30 * 1000) {
+    return tailscaleIpCache.ips;
+  }
+
+  tailscaleIpCache.fetchedAt = now;
+  const result = await spawnAndCollect("tailscale", ["ip", "-4"]).catch(() => ({
+    code: 1,
+    stdout: "",
+    stderr: "",
+  }));
+
+  tailscaleIpCache.ips =
+    result.code === 0
+      ? result.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+      : [];
+
+  return tailscaleIpCache.ips;
+}
 function writeJsonStore() {
   const tempPath = `${DB_PATH}.tmp`;
   fsSync.writeFileSync(tempPath, JSON.stringify(jsonStore, null, 2));
@@ -847,6 +989,10 @@ async function waitForCupsJobToFinish(job) {
 }
 
 function finalizeJobFile(job) {
+  if (previewRetainsJobFile(job)) {
+    return;
+  }
+
   if (!job.cleanupDir) {
     return;
   }
@@ -876,6 +1022,121 @@ function markJobFailed(job, message) {
     error: message,
   });
   finalizeJobFile(job);
+}
+
+function buildUiPreviewResponse() {
+  const preview = getActivePreview();
+  if (!preview) {
+    return null;
+  }
+
+  const job = jobs.get(preview.jobId);
+  if (!job) {
+    return null;
+  }
+
+  const imagePreview = /^image\//.test(preview.contentType || "");
+
+  return {
+    jobId: job.id,
+    jobName: job.jobName,
+    printer: job.printer,
+    status: job.status,
+    createdAt: job.createdAt,
+    expiresAt: new Date(preview.expiresAt).toISOString(),
+    remainingMs: Math.max(0, preview.expiresAt - Date.now()),
+    imageUrl: imagePreview
+      ? `/ui/preview/current?t=${preview.expiresAt}`
+      : null,
+    contentType: imagePreview ? preview.contentType : null,
+  };
+}
+
+async function buildUiState() {
+  const printers = await listPrinters().catch(() => []);
+  const resolvedPrinter = selectPrinter(printers, PRINTER_HINT)?.name || null;
+  const printer =
+    printers.find((entry) => entry?.name === resolvedPrinter) || null;
+  const preview = buildUiPreviewResponse();
+  const activeJob = activeJobId ? jobs.get(activeJobId) || null : null;
+  const openJobs = Array.from(jobs.values()).filter((job) =>
+    ["queued", "submitting", "printing"].includes(job.status)
+  ).length;
+
+  return {
+    hostname: os.hostname(),
+    online: true,
+    status: preview ? "PRINTING" : "READY",
+    tailscaleIps: await getTailscaleIps(),
+    printedToday: getPrintedTodayCount(),
+    defaultPrinter: resolvedPrinter,
+    printer,
+    activeJob: activeJob ? buildJobResponse(activeJob) : null,
+    queue: {
+      activeJobId,
+      queued: queuedJobIds.length,
+      openJobs,
+      knownJobs: jobs.size,
+    },
+    preview,
+    dbBackend: DB_BACKEND,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resolvePublicPath(urlPathname) {
+  const relativePath =
+    urlPathname === "/" ? "index.html" : decodeURIComponent(urlPathname.replace(/^\/+/, ""));
+  const absolutePath = path.resolve(PUBLIC_ROOT, relativePath);
+  if (!absolutePath.startsWith(`${PUBLIC_ROOT}${path.sep}`) && absolutePath !== path.join(PUBLIC_ROOT, "index.html")) {
+    throw new HttpError(403, "Forbidden");
+  }
+  return absolutePath;
+}
+
+async function servePublicFile(res, urlPathname) {
+  const filePath = resolvePublicPath(urlPathname);
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    throw new HttpError(404, "Not found");
+  }
+
+  if (!stat.isFile()) {
+    throw new HttpError(404, "Not found");
+  }
+
+  const payload = await fs.readFile(filePath);
+  res.writeHead(200, {
+    "content-type": contentTypeForFilePath(filePath),
+    "content-length": payload.length,
+    "cache-control": filePath.endsWith("index.html")
+      ? "no-store"
+      : "public, max-age=300",
+  });
+  res.end(payload);
+}
+
+async function servePreviewFile(res) {
+  const preview = getActivePreview();
+  if (!preview || !preview.filePath) {
+    throw new HttpError(404, "No active preview");
+  }
+
+  let payload;
+  try {
+    payload = await fs.readFile(preview.filePath);
+  } catch {
+    throw new HttpError(404, "Preview file not found");
+  }
+
+  res.writeHead(200, {
+    "content-type": preview.contentType || contentTypeForFilePath(preview.filePath),
+    "content-length": payload.length,
+    "cache-control": "no-store",
+  });
+  res.end(payload);
 }
 
 async function runJob(job, options = {}) {
@@ -1126,6 +1387,7 @@ async function handlePrint(req, res) {
   };
 
   jobs.set(job.id, job);
+  rememberPreview(job);
   persistJob(job);
   queuedJobIds.push(job.id);
   kickQueueWorker();
@@ -1156,6 +1418,13 @@ async function handleStats(req, res, url) {
   sendJson(res, 200, {
     ok: true,
     stats: getStats(Number.isInteger(limit) && limit > 0 ? limit : STATS_RECENT_LIMIT),
+  });
+}
+
+async function handleUiState(res) {
+  sendJson(res, 200, {
+    ok: true,
+    state: await buildUiState(),
   });
 }
 
@@ -1201,6 +1470,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/ui/state") {
+      await handleUiState(res);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/ui/preview/current") {
+      await servePreviewFile(res);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/print") {
       await handlePrint(req, res);
       return;
@@ -1209,6 +1488,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname.startsWith("/jobs/")) {
       const jobId = decodeURIComponent(url.pathname.slice("/jobs/".length));
       await handleJobLookup(req, res, jobId);
+      return;
+    }
+
+    if (
+      req.method === "GET" &&
+      (url.pathname === "/" ||
+        url.pathname.startsWith("/assets/") ||
+        /\.(?:css|html|js|json|png|svg|webp)$/i.test(url.pathname))
+    ) {
+      await servePublicFile(res, url.pathname);
       return;
     }
 
@@ -1229,7 +1518,7 @@ async function main() {
     console.log(
       `dnp-print-bridge listening on http://${HOST}:${PORT} using printer hint "${PRINTER_HINT}"`
     );
-    console.log(`sqlite database: ${DB_PATH}`);
+    console.log(`${DB_BACKEND} database: ${DB_PATH}`);
   });
 }
 

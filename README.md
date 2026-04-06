@@ -16,6 +16,14 @@ The goal is simple:
 
 In plain terms, this is a small local print server for a machine that has the printer attached through CUPS. Your other apps can call it to queue photo prints automatically and quietly in the background.
 
+The same service can also host a fullscreen diagnostics UI for a Raspberry Pi kiosk display. That UI shows:
+
+- bridge online status
+- Tailscale IPv4 address
+- jobs printed today
+- current printer queue status
+- a 10 second preview of the most recent image print job before returning to `READY`
+
 The queue is persisted locally so the bridge can recover job history and in-flight jobs after a restart or crash. On newer Node.js versions it uses SQLite; on older environments without `node:sqlite` it falls back to a JSON file.
 
 ## Run
@@ -35,6 +43,7 @@ DEFAULT_MEDIA=4x6
 AUTH_TOKEN=replace-me
 DB_BACKEND=sqlite
 DB_PATH=/path/to/dnp-print-bridge.sqlite
+UI_PREVIEW_MS=10000
 node server.js
 ```
 
@@ -49,6 +58,8 @@ Notes:
 - By default the SQLite database is stored at `./data/dnp-print-bridge.sqlite`.
 - `DB_BACKEND` defaults to `sqlite` when `node:sqlite` is available, otherwise it falls back to `json`.
 - If you use `DB_BACKEND=json`, set `DB_PATH` to a `.json` file path for clarity.
+- The diagnostics UI is served from `/`.
+- The diagnostics JSON state is available from `GET /ui/state`.
 
 Submit the included sample image after the bridge is running:
 
@@ -64,7 +75,13 @@ For older Raspberry Pi hardware that cannot run a recent enough Node.js build fo
 - `DB_BACKEND=json`
 - Gutenprint / CUPS queue `DNP_DSRX1`
 
-The systemd unit used on the Pi is included at `deploy/systemd/dnp-print-bridge.service`.
+The bridge systemd unit is included at `deploy/systemd/dnp-print-bridge.service`.
+
+For a modern Raspberry Pi with a local screen, the kiosk unit is included at:
+
+- `deploy/systemd/dnp-print-bridge-kiosk.service`
+- `deploy/scripts/start-kiosk.sh`
+- `deploy/scripts/configure-raspberry-pi.sh`
 
 The steps below match the setup that was verified on an older ARMv6 Raspberry Pi with a `DNP DS-RX1` attached over USB.
 
@@ -155,7 +172,7 @@ On the verified Pi, Gutenprint exposed `PageSize` values such as:
 
 The bridge now maps friendly sizes like `6x4` to those Gutenprint `PageSize` values automatically when needed.
 
-### 6. Install the systemd service
+### 6. Install the bridge service
 
 From the repo root:
 
@@ -173,7 +190,38 @@ curl http://127.0.0.1:3456/health
 curl http://127.0.0.1:3456/printers
 ```
 
-### 7. Optional real print test
+### 7. Optional kiosk setup for a Raspberry Pi display
+
+If the Pi already boots into another local webpage, the included helper script can disable the old PM2/nginx/chromium startup path, create the DNP queue if it is missing, and enable both the bridge and kiosk services:
+
+```bash
+cd /home/pi/dnp-print-bridge
+chmod +x deploy/scripts/configure-raspberry-pi.sh
+sudo ./deploy/scripts/configure-raspberry-pi.sh
+```
+
+This expects:
+
+- user `pi`
+- an autologin desktop session with X on `:0`
+- Chromium installed as `chromium-browser`
+- Gutenprint model `gutenprint.5.3://dnp-dsrx1/expert`
+
+After it finishes, Chromium should reopen in kiosk mode on:
+
+```bash
+http://127.0.0.1:3456/
+```
+
+Useful checks:
+
+```bash
+systemctl status dnp-print-bridge --no-pager
+systemctl status dnp-print-bridge-kiosk --no-pager
+curl http://127.0.0.1:3456/ui/state
+```
+
+### 8. Optional real print test
 
 This sends a real print job to the selected printer.
 
@@ -241,7 +289,7 @@ lpstat -p
 
 This makes it suitable for photobooth flows where multiple users may print one after another and you want your app to know where each print is in line.
 
-Because jobs are stored in SQLite, the bridge can also:
+Because jobs are stored persistently, the bridge can also:
 
 - keep a history of completed and failed jobs
 - retain job timestamps
