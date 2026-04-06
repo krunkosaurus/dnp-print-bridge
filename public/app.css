@@ -91,7 +91,7 @@ body {
 .topbar h1,
 .hero h2,
 .metric-value,
-.ip-card strong {
+.network-card strong {
   margin: 0;
   letter-spacing: -0.04em;
 }
@@ -103,12 +103,24 @@ body {
 
 .eyebrow,
 .metric-label,
-.ip-label {
+.ip-label,
+.network-note {
   margin: 0 0 0.4rem;
+}
+
+.eyebrow,
+.metric-label,
+.ip-label {
   text-transform: uppercase;
   letter-spacing: 0.18em;
   font-size: 0.74rem;
   color: var(--muted);
+}
+
+.network-note {
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.4;
 }
 
 .live-pill {
@@ -215,17 +227,27 @@ body {
   animation-delay: 0.36s;
 }
 
-.ip-card {
+.network-strip {
   align-self: flex-start;
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.network-card {
+  min-width: 0;
   padding: 1rem 1.1rem;
   border-radius: 1.4rem;
   background: rgba(255, 255, 255, 0.07);
   border: 1px solid rgba(255, 255, 255, 0.09);
+  display: grid;
+  gap: 0.4rem;
 }
 
-.ip-card strong {
-  font-size: clamp(1.2rem, 2.8vw, 1.9rem);
+.network-card strong {
+  font-size: clamp(1.15rem, 2.6vw, 1.7rem);
   word-break: break-word;
+  line-height: 1.1;
 }
 
 .hero-stage {
@@ -420,6 +442,10 @@ body {
 
   .hero,
   .metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .network-strip {
     grid-template-columns: 1fr;
   }
 

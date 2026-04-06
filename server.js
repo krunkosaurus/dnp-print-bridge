@@ -28,6 +28,7 @@ const TMP_ROOT = process.env.TMPDIR || os.tmpdir();
 const JOB_POLL_MS = Number(process.env.JOB_POLL_MS || 2000);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 20 * 60 * 1000);
 const UI_PREVIEW_MS = Number(process.env.UI_PREVIEW_MS || 10 * 1000);
+const WIFI_INTERFACE = process.env.WIFI_INTERFACE || "wlan0";
 const DB_BACKEND =
   process.env.DB_BACKEND || (DatabaseSync ? "sqlite" : "json");
 const DB_PATH =
@@ -103,6 +104,15 @@ let tailscaleIpCache = {
   fetchedAt: 0,
   ips: [],
 };
+let wifiCache = {
+  fetchedAt: 0,
+  state: {
+    interface: WIFI_INTERFACE,
+    ssid: null,
+    wpaState: "UNKNOWN",
+    connected: false,
+  },
+};
 
 function sendJson(res, statusCode, body) {
   const payload = JSON.stringify(body, null, 2);
@@ -115,6 +125,20 @@ function sendJson(res, statusCode, body) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function spawnAndCollectFirstAvailable(commands, args) {
+  let lastError = null;
+
+  for (const command of commands) {
+    try {
+      return await spawnAndCollect(command, args);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error(`Unable to run command: ${commands.join(", ")}`);
 }
 
 function spawnAndCollect(command, args) {
@@ -548,6 +572,54 @@ async function getTailscaleIps() {
       : [];
 
   return tailscaleIpCache.ips;
+}
+
+async function getWifiStatus() {
+  const now = Date.now();
+  if (now - wifiCache.fetchedAt < 10 * 1000) {
+    return wifiCache.state;
+  }
+
+  wifiCache.fetchedAt = now;
+  const result = await spawnAndCollectFirstAvailable(
+    ["/usr/sbin/wpa_cli", "/sbin/wpa_cli", "wpa_cli"],
+    ["-i", WIFI_INTERFACE, "status"]
+  ).catch(() => ({
+    code: 1,
+    stdout: "",
+    stderr: "",
+  }));
+
+  if (result.code !== 0) {
+    wifiCache.state = {
+      interface: WIFI_INTERFACE,
+      ssid: null,
+      wpaState: "UNAVAILABLE",
+      connected: false,
+    };
+    return wifiCache.state;
+  }
+
+  const fields = {};
+  for (const line of result.stdout.split("\n")) {
+    const [key, ...rest] = line.split("=");
+    if (!key || rest.length === 0) {
+      continue;
+    }
+    fields[key] = rest.join("=").trim();
+  }
+
+  const ssid = fields.ssid || null;
+  const wpaState = fields.wpa_state || "UNKNOWN";
+
+  wifiCache.state = {
+    interface: WIFI_INTERFACE,
+    ssid,
+    wpaState,
+    connected: Boolean(ssid && wpaState === "COMPLETED"),
+  };
+
+  return wifiCache.state;
 }
 function writeJsonStore() {
   const tempPath = `${DB_PATH}.tmp`;
@@ -1067,6 +1139,7 @@ async function buildUiState() {
     hostname: os.hostname(),
     online: true,
     status: preview ? "PRINTING" : "READY",
+    wifi: await getWifiStatus(),
     tailscaleIps: await getTailscaleIps(),
     printedToday: getPrintedTodayCount(),
     defaultPrinter: resolvedPrinter,

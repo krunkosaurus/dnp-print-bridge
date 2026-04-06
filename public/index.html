@@ -38,9 +38,18 @@
             Listening for the next print request.
           </p>
 
-          <div class="ip-card">
-            <span class="ip-label">Tailscale</span>
-            <strong id="tailscale-ip">Checking…</strong>
+          <div class="network-strip">
+            <div class="network-card">
+              <span class="ip-label">Wi-Fi</span>
+              <strong id="wifi-name">Checking…</strong>
+              <span class="network-note" id="wifi-detail">Detecting local wireless link</span>
+            </div>
+
+            <div class="network-card">
+              <span class="ip-label">Tailscale</span>
+              <strong id="tailscale-ip">Checking…</strong>
+              <span class="network-note">Reach this bridge over your tailnet</span>
+            </div>
           </div>
         </div>
 

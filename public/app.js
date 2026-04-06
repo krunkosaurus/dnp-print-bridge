@@ -3,6 +3,8 @@ const stateRefs = {
   liveLabel: document.getElementById("live-label"),
   statusText: document.getElementById("status-text"),
   statusDetail: document.getElementById("status-detail"),
+  wifiName: document.getElementById("wifi-name"),
+  wifiDetail: document.getElementById("wifi-detail"),
   tailscaleIp: document.getElementById("tailscale-ip"),
   previewImage: document.getElementById("preview-image"),
   previewReady: document.getElementById("preview-ready"),
@@ -79,12 +81,19 @@ function renderState(state) {
   const preview = state.preview || null;
   const printer = state.printer || null;
   const queue = state.queue || {};
+  const wifi = state.wifi || {};
 
   setConnectivity(true);
   stateRefs.statusText.textContent = preview ? "PRINTING" : "READY";
   stateRefs.statusDetail.textContent = preview
     ? `Dispatching ${preview.jobName} to ${preview.printer || "the printer"}.`
     : "Listening for the next print request.";
+  stateRefs.wifiName.textContent = wifi.ssid || "Not connected";
+  stateRefs.wifiDetail.textContent = wifi.ssid
+    ? `Connected on ${wifi.interface || "wlan0"}`
+    : wifi.wpaState === "UNAVAILABLE"
+      ? "Wi-Fi status is unavailable on this host"
+      : `${wifi.interface || "wlan0"} is not associated`;
   stateRefs.tailscaleIp.textContent = formatIpList(state.tailscaleIps);
   stateRefs.printedToday.textContent = String(state.printedToday || 0);
   stateRefs.printerName.textContent = state.defaultPrinter || "No printer queue";
@@ -107,6 +116,8 @@ function renderOffline(error) {
   setConnectivity(false);
   stateRefs.statusText.textContent = "OFFLINE";
   stateRefs.statusDetail.textContent = "Waiting for the local print bridge to respond.";
+  stateRefs.wifiName.textContent = "Unavailable";
+  stateRefs.wifiDetail.textContent = "Bridge offline";
   stateRefs.tailscaleIp.textContent = "Unavailable";
   stateRefs.printerName.textContent = "Bridge unavailable";
   stateRefs.printerStatus.textContent = error || "No response from /ui/state";
