@@ -67,6 +67,44 @@ Submit the included sample image after the bridge is running:
 npm run sample
 ```
 
+## Test Page
+
+For browser-based integration testing against a bridge reachable over Tailscale,
+start the standalone test harness:
+
+```bash
+npm run test-page
+```
+
+By default it serves:
+
+```bash
+http://127.0.0.1:3460
+```
+
+You can override the bind host or port:
+
+```bash
+TEST_PAGE_HOST=0.0.0.0
+TEST_PAGE_PORT=3460
+npm run test-page
+```
+
+The page lets you:
+
+- enter a Tailscale IP, hostname, `host:port`, or full bridge URL
+- add an optional bridge `AUTH_TOKEN`
+- drag and drop any image file for submission
+- override `size`, `copies`, and `printer`
+- inspect live data from the remote bridge through `/health`, `/ui/state`, `/stats`, `/printers`, and `/jobs/:id`
+
+Examples of valid targets:
+
+- `100.64.0.12`
+- `100.64.0.12:3456`
+- `printer-node.ts.net`
+- `http://100.64.0.12:3456`
+
 ## Raspberry Pi Deployment
 
 For older Raspberry Pi hardware that cannot run a recent enough Node.js build for `node:sqlite`, this bridge can run with:

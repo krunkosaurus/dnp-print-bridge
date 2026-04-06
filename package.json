@@ -6,6 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "sample": "node sample-print.js"
+    "sample": "node sample-print.js",
+    "test-page": "node test-page-server.js"
   }
 }

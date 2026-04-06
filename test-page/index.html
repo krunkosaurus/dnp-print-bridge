@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DNP Print Bridge Test Page</title>
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <div class="backdrop backdrop-left"></div>
+    <div class="backdrop backdrop-right"></div>
+
+    <main class="shell">
+      <header class="masthead panel">
+        <div>
+          <p class="eyebrow">Integration Harness</p>
+          <h1>DNP Print Bridge Test Page</h1>
+          <p class="lede">
+            Point this page at a bridge running on your tailnet, drop an image,
+            and watch the live bridge responses while the job moves through the queue.
+          </p>
+        </div>
+        <div class="harness-status" id="harness-status">Idle</div>
+      </header>
+
+      <section class="workspace">
+        <section class="panel controls">
+          <div class="section-heading">
+            <p class="eyebrow">Remote Bridge</p>
+            <h2>Connection</h2>
+          </div>
+
+          <form id="bridge-form" class="form-grid">
+            <label>
+              <span>Tailnet target</span>
+              <input id="target-input" name="target" placeholder="100.x.x.x or http://100.x.x.x:3456" required>
+            </label>
+
+            <label>
+              <span>Auth token</span>
+              <input id="auth-token-input" name="authToken" type="password" placeholder="Optional Bearer token">
+            </label>
+
+            <label>
+              <span>Size</span>
+              <input id="size-input" name="size" value="6x4" placeholder="6x4">
+            </label>
+
+            <label>
+              <span>Copies</span>
+              <input id="copies-input" name="copies" type="number" min="1" max="99" value="1">
+            </label>
+
+            <label>
+              <span>Printer override</span>
+              <input id="printer-input" name="printer" placeholder="Optional remote printer queue">
+            </label>
+
+            <label>
+              <span>Job name</span>
+              <input id="job-name-input" name="jobName" value="tailscale-test-print" placeholder="tailscale-test-print">
+            </label>
+
+            <div class="button-row">
+              <button type="submit" class="button button-secondary">Refresh bridge data</button>
+              <button type="button" class="button button-ghost" id="clear-job-button">Clear job view</button>
+            </div>
+          </form>
+
+          <div class="bridge-summary" id="bridge-summary">
+            <article class="summary-card">
+              <span class="summary-label">Target</span>
+              <strong id="summary-target">Not connected</strong>
+              <span class="summary-note" id="summary-updated">No remote snapshot yet</span>
+            </article>
+
+            <article class="summary-card">
+              <span class="summary-label">Remote status</span>
+              <strong id="summary-status">Unknown</strong>
+              <span class="summary-note" id="summary-printer">Printer data unavailable</span>
+            </article>
+
+            <article class="summary-card">
+              <span class="summary-label">Open jobs</span>
+              <strong id="summary-jobs">0</strong>
+              <span class="summary-note" id="summary-tailscale">No tailnet data yet</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel drop-panel">
+          <div class="section-heading">
+            <p class="eyebrow">Print Payload</p>
+            <h2>Drop Image</h2>
+          </div>
+
+          <label class="dropzone" id="dropzone">
+            <input id="file-input" type="file" accept="image/*" hidden>
+            <div class="drop-copy">
+              <strong>Drag and drop any image here</strong>
+              <span>or click to choose a JPEG, PNG, WEBP, or GIF file</span>
+            </div>
+            <div class="drop-preview" id="drop-preview">
+              <img id="preview-image" alt="Selected image preview">
+              <div class="preview-empty" id="preview-empty">No image selected</div>
+              <div class="preview-overlay" id="preview-overlay" aria-hidden="true">
+                <span>Print submitted</span>
+              </div>
+            </div>
+          </label>
+
+          <div class="selection-meta">
+            <span id="file-name">No file selected</span>
+            <span id="file-detail">The dropped image will be sent to the remote bridge as a data URL.</span>
+          </div>
+
+          <div class="button-row">
+            <button type="button" class="button button-primary" id="print-button" disabled>Submit print job</button>
+            <button type="button" class="button button-ghost" id="remove-file-button" disabled>Remove image</button>
+          </div>
+        </section>
+      </section>
+
+      <section class="workspace lower">
+        <section class="panel job-panel">
+          <div class="section-heading">
+            <p class="eyebrow">Live Job</p>
+            <h2>Bridge Response</h2>
+          </div>
+
+          <div class="job-strip">
+            <article class="summary-card">
+              <span class="summary-label">Job ID</span>
+              <strong id="job-id">Waiting</strong>
+              <span class="summary-note" id="job-created">No job accepted yet</span>
+            </article>
+
+            <article class="summary-card">
+              <span class="summary-label">Status</span>
+              <strong id="job-status">Idle</strong>
+              <span class="summary-note" id="job-detail">Submit a job to start polling</span>
+            </article>
+
+            <article class="summary-card">
+              <span class="summary-label">CUPS request</span>
+              <strong id="job-cups">-</strong>
+              <span class="summary-note" id="job-error">No error reported</span>
+            </article>
+          </div>
+
+          <div class="log" id="event-log" aria-live="polite"></div>
+        </section>
+
+        <section class="panel raw-panel">
+          <div class="section-heading">
+            <p class="eyebrow">Remote Data</p>
+            <h2>JSON</h2>
+          </div>
+
+          <div class="raw-grid">
+            <article>
+              <h3>Bridge snapshot</h3>
+              <pre id="inspect-json">No remote data loaded.</pre>
+            </article>
+            <article>
+              <h3>Latest job payload</h3>
+              <pre id="job-json">No job activity yet.</pre>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
