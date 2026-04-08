@@ -362,6 +362,51 @@ function selectPrinter(printers, hint = PRINTER_HINT) {
   return null;
 }
 
+function normalizeJsonStore(store) {
+  if (!store || typeof store !== "object" || Array.isArray(store)) {
+    return { jobs: {} };
+  }
+
+  if (!store.jobs || typeof store.jobs !== "object" || Array.isArray(store.jobs)) {
+    store.jobs = {};
+  }
+
+  return store;
+}
+
+function writeJsonStoreFile(targetPath, store) {
+  const tempPath = `${targetPath}.tmp`;
+  fsSync.writeFileSync(tempPath, JSON.stringify(store, null, 2));
+  fsSync.renameSync(tempPath, targetPath);
+}
+
+function loadJsonStoreWithRecovery() {
+  const raw = fsSync.readFileSync(DB_PATH, "utf8");
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { jobs: {} };
+  }
+
+  try {
+    return normalizeJsonStore(JSON.parse(trimmed));
+  } catch (error) {
+    const sanitized = trimmed.replace(/\u0000+/g, "");
+    if (sanitized === trimmed) {
+      throw error;
+    }
+
+    const recovered = normalizeJsonStore(JSON.parse(sanitized));
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = `${DB_PATH}.corrupt-${timestamp}`;
+    fsSync.copyFileSync(DB_PATH, backupPath);
+    writeJsonStoreFile(DB_PATH, recovered);
+    console.warn(
+      `Recovered JSON database from NUL-byte corruption and backed up the original to ${backupPath}`
+    );
+    return recovered;
+  }
+}
+
 async function initDatabase() {
   await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
   if (DB_BACKEND === "sqlite") {
@@ -393,8 +438,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at);
     `);
   } else if (fsSync.existsSync(DB_PATH)) {
-    const raw = fsSync.readFileSync(DB_PATH, "utf8").trim();
-    jsonStore = raw ? JSON.parse(raw) : { jobs: {} };
+    jsonStore = loadJsonStoreWithRecovery();
   } else {
     jsonStore = { jobs: {} };
     writeJsonStore();
@@ -621,10 +665,9 @@ async function getWifiStatus() {
 
   return wifiCache.state;
 }
+
 function writeJsonStore() {
-  const tempPath = `${DB_PATH}.tmp`;
-  fsSync.writeFileSync(tempPath, JSON.stringify(jsonStore, null, 2));
-  fsSync.renameSync(tempPath, DB_PATH);
+  writeJsonStoreFile(DB_PATH, jsonStore);
 }
 
 function loadPersistedJobs() {
