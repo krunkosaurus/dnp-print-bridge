@@ -114,6 +114,8 @@ For older Raspberry Pi hardware that cannot run a recent enough Node.js build fo
 - Gutenprint / CUPS queue `DNP_DSRX1`
 
 The bridge systemd unit is included at `deploy/systemd/dnp-print-bridge.service`.
+The test page systemd unit is included at
+`deploy/systemd/dnp-print-bridge-test-page.service`.
 
 For a modern Raspberry Pi with a local screen, the kiosk unit is included at:
 
@@ -218,6 +220,17 @@ From the repo root:
 sudo cp deploy/systemd/dnp-print-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now dnp-print-bridge
+```
+
+### 7. Optional: install the test page on port 80
+
+If you want the standalone browser test harness to be reachable on port `80` and
+start on boot:
+
+```bash
+sudo cp deploy/systemd/dnp-print-bridge-test-page.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now dnp-print-bridge-test-page
 ```
 
 Check service state:

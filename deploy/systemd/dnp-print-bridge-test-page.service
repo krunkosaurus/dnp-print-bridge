@@ -1,0 +1,19 @@
+[Unit]
+Description=DNP Print Bridge Test Page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/dnp-print-bridge
+Environment=TEST_PAGE_HOST=0.0.0.0
+Environment=TEST_PAGE_PORT=80
+ExecStart=/usr/bin/env node /home/pi/dnp-print-bridge/test-page-server.js
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
