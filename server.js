@@ -38,6 +38,14 @@ const DB_PATH =
     "data",
     DB_BACKEND === "sqlite" ? "dnp-print-bridge.sqlite" : "dnp-print-bridge.json"
   );
+const LEGACY_JSON_DB_PATH =
+  process.env.LEGACY_JSON_DB_PATH ||
+  (DB_BACKEND === "sqlite"
+    ? path.join(
+        path.dirname(DB_PATH),
+        `${path.basename(DB_PATH, path.extname(DB_PATH))}.json`
+      )
+    : DB_PATH);
 const STATS_RECENT_LIMIT = Number(process.env.STATS_RECENT_LIMIT || 20);
 const PUBLIC_ROOT = path.join(__dirname, "public");
 
@@ -380,8 +388,8 @@ function writeJsonStoreFile(targetPath, store) {
   fsSync.renameSync(tempPath, targetPath);
 }
 
-function loadJsonStoreWithRecovery() {
-  const raw = fsSync.readFileSync(DB_PATH, "utf8");
+function loadJsonStoreWithRecovery(jsonPath = DB_PATH) {
+  const raw = fsSync.readFileSync(jsonPath, "utf8");
   const trimmed = raw.trim();
   if (!trimmed) {
     return { jobs: {} };
@@ -397,14 +405,131 @@ function loadJsonStoreWithRecovery() {
 
     const recovered = normalizeJsonStore(JSON.parse(sanitized));
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = `${DB_PATH}.corrupt-${timestamp}`;
-    fsSync.copyFileSync(DB_PATH, backupPath);
-    writeJsonStoreFile(DB_PATH, recovered);
+    const backupPath = `${jsonPath}.corrupt-${timestamp}`;
+    fsSync.copyFileSync(jsonPath, backupPath);
+    writeJsonStoreFile(jsonPath, recovered);
     console.warn(
       `Recovered JSON database from NUL-byte corruption and backed up the original to ${backupPath}`
     );
     return recovered;
   }
+}
+
+function countSqliteJobs() {
+  if (!sqliteDb) {
+    return 0;
+  }
+
+  const row = sqliteDb.prepare("SELECT COUNT(*) AS total FROM jobs").get();
+  return Number(row?.total || 0);
+}
+
+function upsertSqliteJob(job) {
+  sqliteDb
+    .prepare(
+      `
+        INSERT INTO jobs (
+          id,
+          queue_order,
+          status,
+          printer,
+          job_name,
+          copies,
+          requested_size,
+          media,
+          payload_json,
+          file_path,
+          cleanup_dir,
+          cups_request_id,
+          error,
+          created_at,
+          started_at,
+          completed_at,
+          is_terminal
+        ) VALUES (
+          @id,
+          @queue_order,
+          @status,
+          @printer,
+          @job_name,
+          @copies,
+          @requested_size,
+          @media,
+          @payload_json,
+          @file_path,
+          @cleanup_dir,
+          @cups_request_id,
+          @error,
+          @created_at,
+          @started_at,
+          @completed_at,
+          @is_terminal
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          queue_order = excluded.queue_order,
+          status = excluded.status,
+          printer = excluded.printer,
+          job_name = excluded.job_name,
+          copies = excluded.copies,
+          requested_size = excluded.requested_size,
+          media = excluded.media,
+          payload_json = excluded.payload_json,
+          file_path = excluded.file_path,
+          cleanup_dir = excluded.cleanup_dir,
+          cups_request_id = excluded.cups_request_id,
+          error = excluded.error,
+          created_at = excluded.created_at,
+          started_at = excluded.started_at,
+          completed_at = excluded.completed_at,
+          is_terminal = excluded.is_terminal
+      `
+    )
+    .run({
+      id: job.id,
+      queue_order: job.queueOrder,
+      status: job.status,
+      printer: job.printer,
+      job_name: job.jobName,
+      copies: job.copies,
+      requested_size: job.requestedSize || "",
+      media: job.media || "",
+      payload_json: JSON.stringify(job.payload),
+      file_path: job.filePath || null,
+      cleanup_dir: job.cleanupDir || null,
+      cups_request_id: job.cupsRequestId || null,
+      error: job.error || null,
+      created_at: job.createdAt,
+      started_at: job.startedAt || null,
+      completed_at: job.completedAt || null,
+      is_terminal: job.isTerminal ? 1 : 0,
+    });
+}
+
+function migrateLegacyJsonStoreToSqlite() {
+  if (
+    LEGACY_JSON_DB_PATH === DB_PATH ||
+    !fsSync.existsSync(LEGACY_JSON_DB_PATH) ||
+    countSqliteJobs() > 0
+  ) {
+    return 0;
+  }
+
+  const legacyStore = loadJsonStoreWithRecovery(LEGACY_JSON_DB_PATH);
+  const legacyJobs = Object.values(legacyStore.jobs || {})
+    .map(hydrateJsonJob)
+    .sort(compareJobs);
+
+  for (const job of legacyJobs) {
+    upsertSqliteJob(job);
+  }
+
+  if (legacyJobs.length > 0) {
+    console.log(
+      `Migrated ${legacyJobs.length} jobs from ${LEGACY_JSON_DB_PATH} to ${DB_PATH}`
+    );
+  }
+
+  return legacyJobs.length;
 }
 
 async function initDatabase() {
@@ -437,6 +562,7 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
       CREATE INDEX IF NOT EXISTS idx_jobs_completed_at ON jobs(completed_at);
     `);
+    migrateLegacyJsonStoreToSqlite();
   } else if (fsSync.existsSync(DB_PATH)) {
     jsonStore = loadJsonStoreWithRecovery();
   } else {
@@ -685,84 +811,7 @@ function loadPersistedJobs() {
 
 function persistJob(job) {
   if (DB_BACKEND === "sqlite") {
-    sqliteDb
-      .prepare(
-        `
-          INSERT INTO jobs (
-            id,
-            queue_order,
-            status,
-            printer,
-            job_name,
-            copies,
-            requested_size,
-            media,
-            payload_json,
-            file_path,
-            cleanup_dir,
-            cups_request_id,
-            error,
-            created_at,
-            started_at,
-            completed_at,
-            is_terminal
-          ) VALUES (
-            @id,
-            @queue_order,
-            @status,
-            @printer,
-            @job_name,
-            @copies,
-            @requested_size,
-            @media,
-            @payload_json,
-            @file_path,
-            @cleanup_dir,
-            @cups_request_id,
-            @error,
-            @created_at,
-            @started_at,
-            @completed_at,
-            @is_terminal
-          )
-          ON CONFLICT(id) DO UPDATE SET
-            queue_order = excluded.queue_order,
-            status = excluded.status,
-            printer = excluded.printer,
-            job_name = excluded.job_name,
-            copies = excluded.copies,
-            requested_size = excluded.requested_size,
-            media = excluded.media,
-            payload_json = excluded.payload_json,
-            file_path = excluded.file_path,
-            cleanup_dir = excluded.cleanup_dir,
-            cups_request_id = excluded.cups_request_id,
-            error = excluded.error,
-            created_at = excluded.created_at,
-            started_at = excluded.started_at,
-            completed_at = excluded.completed_at,
-            is_terminal = excluded.is_terminal
-        `
-      )
-      .run({
-        id: job.id,
-        queue_order: job.queueOrder,
-        status: job.status,
-        printer: job.printer,
-        job_name: job.jobName,
-        copies: job.copies,
-        requested_size: job.requestedSize || "",
-        media: job.media || "",
-        payload_json: JSON.stringify(job.payload),
-        file_path: job.filePath || null,
-        cleanup_dir: job.cleanupDir || null,
-        cups_request_id: job.cupsRequestId || null,
-        error: job.error || null,
-        created_at: job.createdAt,
-        started_at: job.startedAt || null,
-        completed_at: job.completedAt || null,
-        is_terminal: job.isTerminal ? 1 : 0,
-      });
+    upsertSqliteJob(job);
     return;
   }
 

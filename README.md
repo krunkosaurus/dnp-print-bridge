@@ -57,6 +57,7 @@ Notes:
 - The bridge accepts either friendly sizes like `6x4` or raw CUPS media values like `300dnp6x4`.
 - By default the SQLite database is stored at `./data/dnp-print-bridge.sqlite`.
 - `DB_BACKEND` defaults to `sqlite` when `node:sqlite` is available, otherwise it falls back to `json`.
+- If you switch a deployment from `json` to `sqlite` and keep the same `data/` directory, the bridge migrates the legacy JSON job store into SQLite on first startup.
 - If you use `DB_BACKEND=json`, set `DB_PATH` to a `.json` file path for clarity.
 - The diagnostics UI is served from `/`.
 - The diagnostics JSON state is available from `GET /ui/state`.
@@ -110,7 +111,7 @@ Examples of valid targets:
 For older Raspberry Pi hardware that cannot run a recent enough Node.js build for `node:sqlite`, this bridge can run with:
 
 - `Node.js 18`
-- `DB_BACKEND=json`
+- automatic fallback to `DB_BACKEND=json` when `node:sqlite` is unavailable
 - Gutenprint / CUPS queue `DNP_DSRX1`
 
 The bridge systemd unit is included at `deploy/systemd/dnp-print-bridge.service`.
