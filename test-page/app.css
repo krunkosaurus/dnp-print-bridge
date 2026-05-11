@@ -144,7 +144,29 @@ input {
 }
 
 .harness-status.error {
+  color: var(--danger);
+  border-color: rgba(255, 141, 141, 0.4);
+  background: rgba(255, 141, 141, 0.12);
+}
+
+.field-message {
+  display: none;
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.field-message.show {
+  display: block;
+}
+
+.field-message.warning {
   color: var(--warning);
+}
+
+.field-message.error {
+  color: var(--danger);
 }
 
 .section-heading {

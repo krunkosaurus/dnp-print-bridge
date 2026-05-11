@@ -38,6 +38,7 @@ const refs = {
   eventLog: document.getElementById("event-log"),
   inspectJson: document.getElementById("inspect-json"),
   jobJson: document.getElementById("job-json"),
+  authTokenMessage: document.getElementById("auth-token-message"),
 };
 
 const state = {
@@ -122,10 +123,67 @@ async function postJson(pathname, body) {
 
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error || `Request failed with HTTP ${response.status}`);
+    const error = new Error(payload?.error || `Request failed with HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
 
   return payload;
+}
+
+function setAuthMessage(text, tone = "") {
+  if (!text) {
+    refs.authTokenMessage.textContent = "";
+    refs.authTokenMessage.classList.remove("show", "warning", "error");
+    return;
+  }
+
+  refs.authTokenMessage.textContent = text;
+  refs.authTokenMessage.classList.add("show");
+  refs.authTokenMessage.classList.remove("warning", "error");
+  if (tone) {
+    refs.authTokenMessage.classList.add(tone);
+  }
+}
+
+function isAuthError(error) {
+  return error && (error.status === 401 || error.status === 403);
+}
+
+function evaluateAuthState({ authToken, probes }) {
+  const authRequired = probes?.health?.payload?.authEnabled === true;
+  const probeList = [probes?.health, probes?.uiState, probes?.stats, probes?.printers];
+  const rejectedProbe = probeList.find(
+    (probe) => probe && probe.ok === false && (probe.status === 401 || probe.status === 403)
+  );
+
+  if (rejectedProbe) {
+    if (!authToken) {
+      setAuthMessage(
+        `This bridge requires an AUTH_TOKEN (got HTTP ${rejectedProbe.status} on ${rejectedProbe.pathname || "a request"}). Paste the token above and refresh.`,
+        "error"
+      );
+      setHarnessStatus("Auth token required", "error");
+    } else {
+      setAuthMessage(
+        `Bridge rejected this token (HTTP ${rejectedProbe.status}). Confirm the AUTH_TOKEN set on the bridge.`,
+        "error"
+      );
+      setHarnessStatus("Auth token rejected by bridge", "error");
+    }
+    return;
+  }
+
+  if (authRequired && !authToken) {
+    setAuthMessage(
+      "This bridge requires an AUTH_TOKEN. Paste it above before submitting a print.",
+      "warning"
+    );
+    return;
+  }
+
+  setAuthMessage("");
 }
 
 function getBridgeSettings() {
@@ -240,6 +298,12 @@ function updateInspectSummary(payload) {
   const uiState = payload.probes?.uiState;
   const health = payload.probes?.health;
   const stats = payload.probes?.stats;
+  const printers = payload.probes?.printers;
+
+  evaluateAuthState({
+    authToken: refs.authTokenInput.value.trim(),
+    probes: { health, uiState, stats, printers },
+  });
 
   const remoteState = uiState?.payload?.state || null;
   refs.summaryStatus.textContent = remoteState?.status || (health?.ok ? "Connected" : "Unavailable");
@@ -437,7 +501,18 @@ function bindEvents() {
     try {
       await inspectBridge(false);
     } catch (error) {
-      setHarnessStatus("Bridge refresh failed", "error");
+      if (isAuthError(error)) {
+        const hasToken = Boolean(refs.authTokenInput.value.trim());
+        setAuthMessage(
+          hasToken
+            ? `Bridge rejected this token (HTTP ${error.status}). Confirm the AUTH_TOKEN set on the bridge.`
+            : `This bridge requires an AUTH_TOKEN (got HTTP ${error.status}). Paste the token above and refresh.`,
+          "error"
+        );
+        setHarnessStatus("Auth token required", "error");
+      } else {
+        setHarnessStatus("Bridge refresh failed", "error");
+      }
       appendLog("Bridge snapshot failed", error.message, "error");
     }
   });
@@ -446,7 +521,18 @@ function bindEvents() {
     try {
       await handlePrint();
     } catch (error) {
-      setHarnessStatus("Print submission failed", "error");
+      if (isAuthError(error)) {
+        const hasToken = Boolean(refs.authTokenInput.value.trim());
+        setAuthMessage(
+          hasToken
+            ? `Bridge rejected this token (HTTP ${error.status}). Confirm the AUTH_TOKEN set on the bridge.`
+            : `This bridge requires an AUTH_TOKEN (got HTTP ${error.status}). Paste the token above and try again.`,
+          "error"
+        );
+        setHarnessStatus("Auth token required", "error");
+      } else {
+        setHarnessStatus("Print submission failed", "error");
+      }
       appendLog("Print submission failed", error.message, "error");
     }
   });
@@ -510,6 +596,10 @@ function bindEvents() {
     refs.jobNameInput,
   ].forEach((input) => {
     input.addEventListener("change", saveSettings);
+  });
+
+  refs.authTokenInput.addEventListener("input", () => {
+    setAuthMessage("");
   });
 
   window.addEventListener("beforeunload", () => {
