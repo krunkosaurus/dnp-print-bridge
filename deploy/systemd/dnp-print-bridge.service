@@ -11,8 +11,10 @@ WorkingDirectory=/home/pi/dnp-print-bridge
 Environment=HOST=0.0.0.0
 Environment=PORT=3456
 Environment=PRINTER_NAME=DNP_DSRX1
-ExecStart=/usr/bin/env node /home/pi/dnp-print-bridge/server.js
 Environment=UI_PREVIEW_MS=10000
+Environment=TAILSCALE_AUTH_ENABLED=1
+Environment=TAILSCALE_AUTH_INTERVAL_MS=60000
+ExecStart=/usr/bin/env node /home/pi/dnp-print-bridge/server.js
 Restart=on-failure
 RestartSec=3
 

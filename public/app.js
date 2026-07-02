@@ -6,6 +6,10 @@ const stateRefs = {
   wifiName: document.getElementById("wifi-name"),
   wifiDetail: document.getElementById("wifi-detail"),
   tailscaleIp: document.getElementById("tailscale-ip"),
+  tailscaleAuth: document.getElementById("tailscale-auth"),
+  tailscaleAuthDetail: document.getElementById("tailscale-auth-detail"),
+  tailscaleAuthUrl: document.getElementById("tailscale-auth-url"),
+  tailscaleAuthQr: document.getElementById("tailscale-auth-qr"),
   previewImage: document.getElementById("preview-image"),
   previewReady: document.getElementById("preview-ready"),
   previewMeta: document.getElementById("preview-meta"),
@@ -31,12 +35,59 @@ function formatClock(date) {
   }).format(date);
 }
 
-function formatIpList(ips) {
-  if (!Array.isArray(ips) || ips.length === 0) {
-    return "Not connected";
+function formatWifiDetail(wifi) {
+  const ips = Array.isArray(wifi.ips) ? wifi.ips.filter(Boolean) : [];
+  const sshHint = ips.length > 0 ? ` | ssh pi@${ips[0]}` : "";
+
+  if (wifi.ssid) {
+    return `Connected on ${wifi.interface || "wlan0"}${sshHint}`;
   }
 
-  return ips.join("  ");
+  if (ips.length > 0) {
+    return `${wifi.interface || "wlan0"} has ${ips.join("  ")}${sshHint}`;
+  }
+
+  if (wifi.wpaState === "UNAVAILABLE") {
+    return "Wi-Fi status is unavailable on this host";
+  }
+
+  return `${wifi.interface || "wlan0"} is not associated`;
+}
+
+function formatTailscale(tailscale, legacyIps) {
+  const ips = Array.isArray(tailscale?.ips) ? tailscale.ips : legacyIps;
+
+  if (Array.isArray(ips) && ips.length > 0) {
+    return ips.join("  ");
+  }
+
+  if (tailscale?.authRequired) {
+    return "Login required";
+  }
+
+  if (tailscale?.backendState) {
+    return tailscale.backendState;
+  }
+
+  return "Not connected";
+}
+
+function renderTailscaleAuth(tailscale) {
+  const authUrl = tailscale?.authUrl || "";
+  const authQr = tailscale?.authQr || "";
+  const shouldShow = Boolean(tailscale?.authRequired && authUrl);
+
+  stateRefs.tailscaleAuth.classList.toggle("hidden", !shouldShow);
+  if (!shouldShow) {
+    stateRefs.tailscaleAuthUrl.textContent = "";
+    stateRefs.tailscaleAuthQr.textContent = "";
+    return;
+  }
+
+  stateRefs.tailscaleAuthDetail.textContent =
+    "Scan this QR code to reconnect the bridge to your tailnet.";
+  stateRefs.tailscaleAuthUrl.textContent = authUrl;
+  stateRefs.tailscaleAuthQr.textContent = authQr || authUrl;
 }
 
 function setConnectivity(online) {
@@ -82,6 +133,7 @@ function renderState(state) {
   const printer = state.printer || null;
   const queue = state.queue || {};
   const wifi = state.wifi || {};
+  const tailscale = state.tailscale || {};
 
   setConnectivity(true);
   stateRefs.statusText.textContent = preview ? "PRINTING" : "READY";
@@ -89,12 +141,8 @@ function renderState(state) {
     ? `Dispatching ${preview.jobName} to ${preview.printer || "the printer"}.`
     : "Listening for the next print request.";
   stateRefs.wifiName.textContent = wifi.ssid || "Not connected";
-  stateRefs.wifiDetail.textContent = wifi.ssid
-    ? `Connected on ${wifi.interface || "wlan0"}`
-    : wifi.wpaState === "UNAVAILABLE"
-      ? "Wi-Fi status is unavailable on this host"
-      : `${wifi.interface || "wlan0"} is not associated`;
-  stateRefs.tailscaleIp.textContent = formatIpList(state.tailscaleIps);
+  stateRefs.wifiDetail.textContent = formatWifiDetail(wifi);
+  stateRefs.tailscaleIp.textContent = formatTailscale(tailscale, state.tailscaleIps);
   stateRefs.printedToday.textContent = String(state.printedToday || 0);
   stateRefs.printerName.textContent = state.defaultPrinter || "No printer queue";
   stateRefs.printerStatus.textContent = printer
@@ -110,6 +158,7 @@ function renderState(state) {
     : "Awaiting bridge state";
 
   renderPreview(preview);
+  renderTailscaleAuth(tailscale);
 }
 
 function renderOffline(error) {
@@ -125,6 +174,7 @@ function renderOffline(error) {
   stateRefs.queueDetail.textContent = "Diagnostics paused";
   stateRefs.updatedAt.textContent = "Reconnecting…";
   renderPreview(null);
+  renderTailscaleAuth(null);
 }
 
 async function refreshState() {

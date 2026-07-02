@@ -96,9 +96,26 @@ install_services() {
   systemctl enable --now dnp-print-bridge-kiosk.service
 }
 
+configure_tailscale_operator() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    echo "Tailscale CLI not found; skipping kiosk auth QR operator setup." >&2
+    return
+  fi
+
+  systemctl enable --now tailscaled.service >/dev/null 2>&1 || true
+
+  if tailscale set --operator=pi >/dev/null 2>&1; then
+    echo "Configured Tailscale operator user pi for kiosk auth QR recovery."
+    return
+  fi
+
+  echo "Unable to configure Tailscale operator user pi; QR recovery may need sudo/root permission." >&2
+}
+
 require_root
 disable_legacy_kiosk
 configure_printer_queue
+configure_tailscale_operator
 install_services
 
 echo "Configured ${QUEUE_NAME}, photo defaults, dnp-print-bridge.service, and dnp-print-bridge-kiosk.service."

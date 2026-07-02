@@ -29,6 +29,13 @@ const JOB_POLL_MS = Number(process.env.JOB_POLL_MS || 2000);
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 20 * 60 * 1000);
 const UI_PREVIEW_MS = Number(process.env.UI_PREVIEW_MS || 10 * 1000);
 const WIFI_INTERFACE = process.env.WIFI_INTERFACE || "wlan0";
+const TAILSCALE_AUTH_ENABLED = process.env.TAILSCALE_AUTH_ENABLED !== "0";
+const TAILSCALE_AUTH_INTERVAL_MS = Number(
+  process.env.TAILSCALE_AUTH_INTERVAL_MS || 60 * 1000
+);
+const TAILSCALE_AUTH_TIMEOUT_MS = Number(
+  process.env.TAILSCALE_AUTH_TIMEOUT_MS || 10 * 1000
+);
 const DB_BACKEND =
   process.env.DB_BACKEND || (DatabaseSync ? "sqlite" : "json");
 const DB_PATH =
@@ -108,9 +115,23 @@ let activeJobId = null;
 let queueWorkerRunning = false;
 let activePreview = null;
 let previewTimer = null;
-let tailscaleIpCache = {
+let tailscaleStateCache = {
   fetchedAt: 0,
-  ips: [],
+  state: {
+    ips: [],
+    connected: false,
+    backendState: "UNKNOWN",
+    authRequired: false,
+    authUrl: "",
+    authQr: "",
+    error: null,
+  },
+};
+let tailscaleAuthAttempt = {
+  attemptedAt: 0,
+  authUrl: "",
+  authQr: "",
+  error: null,
 };
 let wifiCache = {
   fetchedAt: 0,
@@ -149,11 +170,23 @@ async function spawnAndCollectFirstAvailable(commands, args) {
   throw lastError || new Error(`Unable to run command: ${commands.join(", ")}`);
 }
 
-function spawnAndCollect(command, args) {
+function spawnAndCollect(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let timeout = null;
+    let killTimeout = null;
+
+    if (options.timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+        killTimeout = setTimeout(() => child.kill("SIGKILL"), 2000);
+      }, options.timeoutMs);
+    }
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -163,12 +196,34 @@ function spawnAndCollect(command, args) {
       stderr += chunk.toString("utf8");
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
     child.on("close", (code) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (killTimeout) {
+        clearTimeout(killTimeout);
+      }
+      if (settled) {
+        return;
+      }
+      settled = true;
       resolve({
         code,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
+        timedOut,
       });
     });
   });
@@ -720,28 +775,165 @@ function previewRetainsJobFile(job) {
   return Boolean(preview && preview.jobId === job.id && preview.filePath === job.filePath);
 }
 
-async function getTailscaleIps() {
-  const now = Date.now();
-  if (now - tailscaleIpCache.fetchedAt < 30 * 1000) {
-    return tailscaleIpCache.ips;
+function stripAnsi(value) {
+  return String(value || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+}
+
+function extractTailscaleAuthUrl(value) {
+  return (
+    stripAnsi(value).match(/https:\/\/login\.tailscale\.com\/[^\s"'<>]+/)?.[0] ||
+    ""
+  );
+}
+
+function extractQrBlock(value) {
+  const lines = stripAnsi(value)
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.replace(/\s+$/g, ""));
+  const qrLines = lines.filter((line) => /[█▀▄]/.test(line));
+
+  if (qrLines.length < 8) {
+    return "";
   }
 
-  tailscaleIpCache.fetchedAt = now;
-  const result = await spawnAndCollect("tailscale", ["ip", "-4"]).catch(() => ({
+  return qrLines.join("\n");
+}
+
+function parseTailscaleIps(status) {
+  return (status?.TailscaleIPs || [])
+    .map((ip) => String(ip || "").trim())
+    .filter((ip) => ip.includes("."));
+}
+
+function getInterfaceIpv4s(interfaceName) {
+  return (os.networkInterfaces()[interfaceName] || [])
+    .filter((entry) => entry.family === "IPv4" && !entry.internal)
+    .map((entry) => entry.address)
+    .filter(Boolean);
+}
+
+async function requestTailscaleAuth() {
+  const args = ["up", "--qr", "--qr-format=small", "--timeout=5s"];
+  const commands = [
+    { command: "tailscale", args },
+    { command: "sudo", args: ["-n", "tailscale", ...args] },
+  ];
+  let lastOutput = "";
+  let lastError = null;
+
+  for (const entry of commands) {
+    const result = await spawnAndCollect(entry.command, entry.args, {
+      timeoutMs: TAILSCALE_AUTH_TIMEOUT_MS,
+    }).catch((error) => {
+      lastError = error;
+      return null;
+    });
+
+    if (!result) {
+      continue;
+    }
+
+    const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    lastOutput = output || lastOutput;
+    const authUrl = extractTailscaleAuthUrl(output);
+    const authQr = extractQrBlock(output);
+
+    if (authUrl || result.code === 0) {
+      return {
+        authUrl,
+        authQr,
+        error: result.code === 0 ? null : output || null,
+      };
+    }
+
+    if (!/permission|sudo|root|not authorized|access denied/i.test(output)) {
+      break;
+    }
+  }
+
+  return {
+    authUrl: "",
+    authQr: "",
+    error: lastOutput || lastError?.message || "Unable to request Tailscale auth URL",
+  };
+}
+
+async function getTailscaleState() {
+  const now = Date.now();
+  if (now - tailscaleStateCache.fetchedAt < 5 * 1000) {
+    return tailscaleStateCache.state;
+  }
+
+  tailscaleStateCache.fetchedAt = now;
+  const result = await spawnAndCollect("tailscale", ["status", "--json"], {
+    timeoutMs: 8 * 1000,
+  }).catch((error) => ({
     code: 1,
     stdout: "",
-    stderr: "",
+    stderr: error.message,
   }));
+  let status = null;
+  let parseError = null;
 
-  tailscaleIpCache.ips =
-    result.code === 0
-      ? result.stdout
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean)
-      : [];
+  if (result.code === 0) {
+    try {
+      status = JSON.parse(result.stdout);
+    } catch (error) {
+      parseError = error.message;
+    }
+  }
 
-  return tailscaleIpCache.ips;
+  const ips = parseTailscaleIps(status);
+  const backendState = status?.BackendState || (result.code === 0 ? "UNKNOWN" : "UNAVAILABLE");
+  const connected = backendState === "Running" && ips.length > 0;
+  let authUrl = status?.AuthURL || "";
+  let authQr = "";
+  let authError = null;
+  const needsLogin = ["NeedsLogin", "NoState", "Stopped"].includes(backendState);
+
+  if (!connected && TAILSCALE_AUTH_ENABLED && needsLogin) {
+    const shouldRefreshAuth =
+      (!authUrl || !tailscaleAuthAttempt.authQr) &&
+      now - tailscaleAuthAttempt.attemptedAt >= TAILSCALE_AUTH_INTERVAL_MS;
+
+    if (shouldRefreshAuth) {
+      tailscaleAuthAttempt.attemptedAt = now;
+      const auth = await requestTailscaleAuth();
+      tailscaleAuthAttempt = {
+        attemptedAt: now,
+        authUrl: auth.authUrl || authUrl,
+        authQr: auth.authQr,
+        error: auth.error,
+      };
+    }
+
+    authUrl = authUrl || tailscaleAuthAttempt.authUrl;
+    authQr = tailscaleAuthAttempt.authQr;
+    authError = tailscaleAuthAttempt.error;
+  }
+
+  if (connected) {
+    tailscaleAuthAttempt = {
+      attemptedAt: 0,
+      authUrl: "",
+      authQr: "",
+      error: null,
+    };
+  }
+
+  tailscaleStateCache.state = {
+    ips,
+    connected,
+    backendState,
+    authRequired: !connected && Boolean(authUrl || needsLogin),
+    authUrl,
+    authQr,
+    error: authError || parseError || (result.code === 0 ? null : result.stderr || "tailscale status failed"),
+    checkedAt: new Date().toISOString(),
+  };
+
+  return tailscaleStateCache.state;
 }
 
 async function getWifiStatus() {
@@ -766,6 +958,7 @@ async function getWifiStatus() {
       ssid: null,
       wpaState: "UNAVAILABLE",
       connected: false,
+      ips: getInterfaceIpv4s(WIFI_INTERFACE),
     };
     return wifiCache.state;
   }
@@ -787,6 +980,7 @@ async function getWifiStatus() {
     ssid,
     wpaState,
     connected: Boolean(ssid && wpaState === "COMPLETED"),
+    ips: getInterfaceIpv4s(WIFI_INTERFACE),
   };
 
   return wifiCache.state;
@@ -1223,6 +1417,7 @@ async function buildUiState() {
     printers.find((entry) => entry?.name === resolvedPrinter) || null;
   const preview = buildUiPreviewResponse();
   const activeJob = activeJobId ? jobs.get(activeJobId) || null : null;
+  const tailscale = await getTailscaleState();
   const openJobs = Array.from(jobs.values()).filter((job) =>
     ["queued", "submitting", "printing"].includes(job.status)
   ).length;
@@ -1232,7 +1427,8 @@ async function buildUiState() {
     online: true,
     status: preview ? "PRINTING" : "READY",
     wifi: await getWifiStatus(),
-    tailscaleIps: await getTailscaleIps(),
+    tailscale,
+    tailscaleIps: tailscale.ips,
     printedToday: getPrintedTodayCount(),
     defaultPrinter: resolvedPrinter,
     printer,

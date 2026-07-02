@@ -19,7 +19,9 @@ In plain terms, this is a small local print server for a machine that has the pr
 The same service can also host a fullscreen diagnostics UI for a Raspberry Pi kiosk display. That UI shows:
 
 - bridge online status
+- Wi-Fi SSID, local IPv4 address, and `ssh pi@...` hint
 - Tailscale IPv4 address
+- Tailscale login QR code when the node is logged out
 - jobs printed today
 - current printer queue status
 - a 10 second preview of the most recent image print job before returning to `READY`
@@ -44,6 +46,8 @@ AUTH_TOKEN=replace-me
 DB_BACKEND=sqlite
 DB_PATH=/path/to/dnp-print-bridge.sqlite
 UI_PREVIEW_MS=10000
+TAILSCALE_AUTH_ENABLED=1
+TAILSCALE_AUTH_INTERVAL_MS=60000
 node server.js
 ```
 
@@ -61,6 +65,7 @@ Notes:
 - If you use `DB_BACKEND=json`, set `DB_PATH` to a `.json` file path for clarity.
 - The diagnostics UI is served from `/`.
 - The diagnostics JSON state is available from `GET /ui/state`.
+- `TAILSCALE_AUTH_ENABLED=1` lets the kiosk UI request a Tailscale login URL with `tailscale up --qr` when `tailscale status --json` reports that login is needed. Set it to `0` to disable the QR recovery panel.
 
 Submit the included sample image after the bridge is running:
 
@@ -258,6 +263,7 @@ This expects:
 - an autologin desktop session with X on `:0`
 - Chromium installed as `chromium-browser`
 - Gutenprint model `gutenprint.5.3://dnp-dsrx1/expert`
+- Tailscale installed if you want tailnet reachability and on-screen auth QR recovery
 
 After it finishes, Chromium should reopen in kiosk mode on:
 
@@ -272,6 +278,13 @@ systemctl status dnp-print-bridge --no-pager
 systemctl status dnp-print-bridge-kiosk --no-pager
 curl http://127.0.0.1:3456/ui/state
 ```
+
+The setup script also runs `tailscale set --operator=pi` when the Tailscale
+CLI is installed. That lets the bridge service, which runs as `pi`, request a
+login QR code without opening a native browser popup. If Tailscale is logged
+out on a later boot, the fullscreen page shows the QR code and auth URL until
+the node is authorized again; once authenticated, the saved
+`/var/lib/tailscale/tailscaled.state` session is reused on future reboots.
 
 ### 8. Optional real print test
 

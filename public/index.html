@@ -95,6 +95,20 @@
       </section>
     </main>
 
+    <section class="tailscale-auth hidden" id="tailscale-auth" aria-live="polite">
+      <div class="tailscale-auth-panel">
+        <div class="tailscale-auth-copy">
+          <p class="eyebrow">Tailscale Login</p>
+          <h2>Authorize this Pi</h2>
+          <p id="tailscale-auth-detail">
+            Scan this QR code to reconnect the bridge to your tailnet.
+          </p>
+          <strong id="tailscale-auth-url"></strong>
+        </div>
+        <pre class="tailscale-auth-qr" id="tailscale-auth-qr" aria-label="Tailscale authorization QR code"></pre>
+      </div>
+    </section>
+
     <script src="/app.js" defer></script>
   </body>
 </html>
